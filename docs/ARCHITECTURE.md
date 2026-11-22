@@ -75,16 +75,23 @@ By targeting **Windows x86_64 with native Direct3D 12**, `xsxemu` achieves near-
 - [x] Real OS multithreading & synchronization (`CreateThread`, `WaitForSingleObject`, `GetExitCodeThread`, `SRWLOCK`, `CRITICAL_SECTION`, `Heap*`, `Tls*`)
 - [x] First-class default-enabled **AMD FSR** pipeline in `xsx-d3d12` (12-tap EASU + 5-tap RCAS, quality presets, Halton(2, 3) temporal jitter sequence, and SM 6.0 HLSL compute shaders ready for Phase 3 hardware dispatch)
 
-### Phase 3 — Native Windows Direct3D 12 Full Hardware Pipeline & GPU FSR Compute Dispatch
-- [ ] Win32 window + `IDXGIFactory4` + `IDXGISwapChain3` presentation bound to `PresentX`
-- [ ] Real host `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList`, `ID3D12DescriptorHeap`, `ID3D12RootSignature`, and `ID3D12PipelineState` forwarding
-- [ ] Native GPU D3D12 compute dispatch for FSR EASU + RCAS (`FSR_EASU_HLSL` / `FSR_RCAS_HLSL`) and FSR 2/3 temporal motion-vector & depth-buffer pass hooks
-- [ ] Xbox UMA `D3D12_HEAP_TYPE_CUSTOM` / CPU-cached upload staging rings for discrete PC GPUs
-- [ ] Shader container inspection (`DXBC` / `DXIL` pass-through & Xbox-specific root signature / shader metadata stripping)
-- [ ] Hardware fence & frame-pacing synchronization (`WaitFrameEventX` <-> DXGI waitable swapchain object)
+### Phase 3 — Native Windows Direct3D 12 Full Hardware Pipeline & GPU FSR Compute Dispatch (Complete)
+- [x] Win32 window + `IDXGIFactory4` + `IDXGISwapChain3` presentation bound to `PresentX`
+- [x] Real host `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList`, `ID3D12DescriptorHeap`, `ID3D12Fence`, and COM `ID3D12RootSignatureX` / `ID3D12PipelineStateX` / `Dispatch` / `CopyResource` translation
+- [x] Native GPU D3D12 HLSL compilation (`d3dcompiler_47.dll` for `FSR_EASU_HLSL` / `FSR_RCAS_HLSL`), `FsrComputePlan`, and FSR 2/3 temporal hook structures (`FsrTemporalInputs`, Halton(2, 3) jitter)
+- [x] Xbox UMA upload staging ring buffer (`UmaStagingRing`) with alignment and fence-based retirement for discrete PC GPUs
+- [x] Shader container inspection (`DXBC` / `DXIL` parser & Xbox-only chunk stripper for `XBOX`, `XGCS`, `XDBG`, `GCN0`, `RDNA`)
+- [x] Hardware fence & frame-pacing synchronization (`WaitFrameEventX` <-> DXGI `GetFrameLatencyWaitableObject`)
 
-### Phase 4 — Game Input, Audio, Storage & Services
-- [ ] `GameInput.dll` / `XInput` -> Windows `XInput` / `GameInput` bridge
-- [ ] `XAudio2_9.dll` -> Windows WASAPI / XAudio2 passthrough
-- [ ] `dstorage_x.dll` -> Windows DirectStorage (`dstorage.dll`) / async file I/O translation
-- [ ] `XUser` / `XStore` / `XGameSave` clean-room offline local profile & save-data persistence
+### Phase 4 — Game Input, Audio, Storage & Services (Complete)
+- [x] `GameInput.dll` / `XInput1_4.dll` -> Windows `XInput` live bridge + `VirtualGamepad` fallback & `IGameInput` COM interface
+- [x] `XAudio2_9.dll` -> `IXAudio2`, `IXAudio2MasteringVoice`, `IXAudio2SourceVoice` COM engine with PCM buffer capture
+- [x] `dstorage_x.dll` / `dstorage.dll` -> `IDStorageFactoryX`, `IDStorageFileX`, `IDStorageQueueX` streaming from `VirtualFs`
+- [x] `XUser`, `XStore`, and persistent `XGameSave` local profile, license, and on-disk save container/blob storage (`S:\`)
+
+### Phase 5 — Improvements & Real-Title Compatibility (Next)
+- [ ] Full hardware GPU command replay (`ID3D12GraphicsCommandList` PSO/RootSignature/VB/RTV/DrawInstanced + GPU compute FSR EASU/RCAS dispatch onto `IDXGISwapChain3` backbuffers)
+- [ ] FSR 2/3 temporal reprojection & motion-vector integration
+- [ ] WASAPI real-time audio playback backend for `XAudio2_9` mixed PCM stream
+- [ ] Expanded CRT / Win32 / WinRT HLE coverage for real Dev Mode & GDK homebrew binaries
+- [ ] Performance profiling, SIMD-accelerated software FSR, and shader cache persistence

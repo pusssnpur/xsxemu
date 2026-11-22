@@ -40,6 +40,10 @@ cargo run -p xsxemu -- gen-phase2 ./phase2_out
 cargo run -p xsxemu -- inspect ./phase2_out/xsx_helper.dll
 cargo run -p xsxemu -- inspect ./phase2_out/phase2_xsx.exe
 cargo run -p xsxemu -- run ./phase2_out/phase2_xsx.exe --trace --force-relocate --dump-frame fsr_frame.bmp
+
+# Phase 3 + Phase 4 full-stack suite (DXBC shader stripping, PSO/Dispatch, DirectStorage, XInput, XAudio2, XUser, XGameSave, FSR)
+cargo run -p xsxemu -- gen-fullstack ./fullstack_out
+cargo run -p xsxemu -- run ./fullstack_out/full_stack_xsx.exe --trace --force-relocate --dump-frame fullstack_fsr.bmp
 ```
 
 ### AMD FSR Upscaling (Enabled by Default)

@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use xsx_d3d12::{BackendKind, FsrConfig, FsrQualityMode, TranslatorConfig};
 use xsx_hle::{GuestRuntime, ModuleRegistry, RuntimeGuard, VirtualFs};
 use xsx_loader::{default_search_dirs, LoadedModuleSet, PeImage};
-use xsx_testgen::{build_hello_xsx_pe, build_helper_dll_pe, build_phase2_xsx_pe};
+use xsx_testgen::{
+    build_full_stack_xsx_pe, build_hello_xsx_pe, build_helper_dll_pe, build_phase2_xsx_pe,
+    FULLSTACK_ASSET_PAYLOAD,
+};
 
 fn print_usage() {
     eprintln!(
@@ -18,11 +21,13 @@ fn print_usage() {
          USAGE:\n\
            xsxemu gen-sample <output.exe>\n\
            xsxemu gen-phase2 <output_dir>\n\
+           xsxemu gen-fullstack <output_dir>\n\
            xsxemu inspect <binary.exe|dll>\n\
            xsxemu run <binary.exe> [OPTIONS]\n\
          \n\
          RUN OPTIONS:\n\
            --backend <auto|d3d12|software>       Select GPU backend (default: auto)\n\
+           --windowed                            Show visible Win32 swapchain window on Windows\n\
            --fsr <quality|balanced|performance|  AMD FSR upscaling preset (default: quality)\n\
                   ultra-quality|ultra-performance|native-aa|off>\n\
            --fsr-sharpness <0.0..=1.0>           RCAS sharpening strength (default: 0.8)\n\
@@ -48,6 +53,7 @@ fn main() -> ExitCode {
     match args[0].as_str() {
         "gen-sample" => cmd_gen_sample(&args[1..]),
         "gen-phase2" => cmd_gen_phase2(&args[1..]),
+        "gen-fullstack" => cmd_gen_fullstack(&args[1..]),
         "inspect" => cmd_inspect(&args[1..]),
         "run" => cmd_run(&args[1..]),
         "-h" | "--help" | "help" => {
@@ -109,6 +115,40 @@ fn cmd_gen_phase2(args: &[String]) -> ExitCode {
         exe_bytes.len(),
         dll_path.display(),
         dll_bytes.len()
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_gen_fullstack(args: &[String]) -> ExitCode {
+    let Some(out_dir) = args.first() else {
+        eprintln!("usage: xsxemu gen-fullstack <output_dir>");
+        return ExitCode::from(2);
+    };
+    let dir = Path::new(out_dir);
+    let assets_dir = dir.join("assets");
+    if let Err(e) = fs::create_dir_all(&assets_dir) {
+        eprintln!("failed to create directory {}: {e}", assets_dir.display());
+        return ExitCode::FAILURE;
+    }
+    let exe_path = dir.join("full_stack_xsx.exe");
+    let asset_path = assets_dir.join("level.bin");
+    let exe_bytes = build_full_stack_xsx_pe();
+
+    if let Err(e) = fs::write(&exe_path, &exe_bytes) {
+        eprintln!("failed to write {}: {e}", exe_path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = fs::write(&asset_path, FULLSTACK_ASSET_PAYLOAD) {
+        eprintln!("failed to write {}: {e}", asset_path.display());
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "Generated Phase 3 + Phase 4 full-stack suite:\n  - {} ({} bytes)\n  - {} ({} bytes)",
+        exe_path.display(),
+        exe_bytes.len(),
+        asset_path.display(),
+        FULLSTACK_ASSET_PAYLOAD.len()
     );
     ExitCode::SUCCESS
 }
@@ -234,6 +274,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     };
 
     let mut backend = BackendKind::Auto;
+    let mut windowed = false;
     let mut fsr = FsrConfig::default(); // Enabled by default (Quality 1.5x EASU + RCAS)
     let mut dump_frame: Option<PathBuf> = None;
     let mut extra_dll_dirs: Vec<PathBuf> = Vec::new();
@@ -262,6 +303,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     }
                 };
             }
+            "--windowed" => windowed = true,
             "--fsr" => {
                 i += 1;
                 let Some(val) = args.get(i) else {
@@ -368,6 +410,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
     }
     if let Some(s) = scratch_dir {
+        vfs.save_root = s.join("saves");
         vfs.scratch_root = s;
     }
 
@@ -375,6 +418,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         backend,
         trace_calls: trace,
         fsr,
+        windowed,
         ..TranslatorConfig::default()
     };
     let runtime = GuestRuntime::with_vfs(cfg, vfs, trace);

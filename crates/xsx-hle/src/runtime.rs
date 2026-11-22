@@ -1,18 +1,23 @@
-//! Active guest runtime state (handles, VFS, threads, sync primitives, TLS, modules, and D3D12/FSR).
+//! Active guest runtime state (handles, VFS, threads, sync primitives, TLS, modules,
+//! Phase 4 input/audio/dstorage/saves state, and D3D12/FSR translator).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use xsx_abi::gdk::{Handle, INFINITE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use xsx_abi::services::{XInputGamepad, XInputVibration};
 use xsx_d3d12::translate::HostDeviceCreateConfig;
 use xsx_d3d12::{D3D12Translator, FsrFrameStats, PresentedFrame, TranslatorConfig};
 use xsx_loader::LoadedModuleSet;
 
+use crate::input::VirtualGamepadState;
+use crate::services::{SaveContainerState, SaveUpdateState};
 use crate::vfs::VirtualFs;
 
 #[derive(Debug)]
@@ -48,6 +53,16 @@ pub enum KernelObject {
         work_mode: u32,
         completion_mode: u32,
     },
+    User {
+        xuid: u64,
+        gamertag: String,
+    },
+    SaveProvider {
+        root_dir: PathBuf,
+    },
+    SaveContainer(SaveContainerState),
+    SaveUpdate(SaveUpdateState),
+    StoreContext,
 }
 
 thread_local! {
@@ -72,6 +87,12 @@ pub struct GuestRuntime {
     d3d12: Mutex<Option<Arc<D3D12Translator>>>,
     heap_allocs: Mutex<HashMap<usize, Vec<u8>>>,
     modules: Mutex<Option<Arc<Mutex<LoadedModuleSet>>>>,
+
+    // Phase 4 state: Virtual gamepads, XAudio2 PCM capture, DirectStorage telemetry
+    gamepads: Mutex<[VirtualGamepadState; 4]>,
+    audio_pcm_bytes: Mutex<Vec<u8>>,
+    audio_samples_submitted: AtomicU64,
+    dstorage_bytes_read: AtomicU64,
 }
 
 impl GuestRuntime {
@@ -101,6 +122,15 @@ impl GuestRuntime {
             d3d12: Mutex::new(None),
             heap_allocs: Mutex::new(HashMap::new()),
             modules: Mutex::new(None),
+            gamepads: Mutex::new([
+                VirtualGamepadState::connected_default(),
+                VirtualGamepadState::default(),
+                VirtualGamepadState::default(),
+                VirtualGamepadState::default(),
+            ]),
+            audio_pcm_bytes: Mutex::new(Vec::new()),
+            audio_samples_submitted: AtomicU64::new(0),
+            dstorage_bytes_read: AtomicU64::new(0),
         })
     }
 
@@ -111,6 +141,108 @@ impl GuestRuntime {
     pub fn modules(&self) -> Option<Arc<Mutex<LoadedModuleSet>>> {
         self.modules.lock().unwrap().clone()
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 4 Gamepad, Audio, DirectStorage, and Save helpers
+    // -----------------------------------------------------------------------
+
+    pub fn set_virtual_gamepad(&self, user_index: u32, gamepad: XInputGamepad) {
+        if let Some(slot) = self.gamepads.lock().unwrap().get_mut(user_index as usize) {
+            slot.connected = true;
+            slot.packet_number = slot.packet_number.wrapping_add(1);
+            slot.gamepad = gamepad;
+        }
+    }
+
+    pub fn get_gamepad_state(&self, user_index: u32) -> VirtualGamepadState {
+        self.gamepads
+            .lock()
+            .unwrap()
+            .get(user_index as usize)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_gamepad_vibration(&self, user_index: u32, vib: XInputVibration) {
+        if let Some(slot) = self.gamepads.lock().unwrap().get_mut(user_index as usize) {
+            slot.last_vibration = vib;
+        }
+    }
+
+    pub fn record_audio_pcm(&self, pcm: &[u8], samples: u64) {
+        self.audio_samples_submitted
+            .fetch_add(samples, Ordering::Relaxed);
+        let mut buf = self.audio_pcm_bytes.lock().unwrap();
+        // Cap captured buffer to 4 MiB for telemetry safety
+        if buf.len() + pcm.len() <= 4 * 1024 * 1024 {
+            buf.extend_from_slice(pcm);
+        }
+    }
+
+    pub fn audio_samples_submitted(&self) -> u64 {
+        self.audio_samples_submitted.load(Ordering::Relaxed)
+    }
+
+    pub fn audio_pcm_len(&self) -> usize {
+        self.audio_pcm_bytes.lock().unwrap().len()
+    }
+
+    pub fn record_dstorage_bytes(&self, bytes: u64) {
+        self.dstorage_bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn dstorage_bytes_read(&self) -> u64 {
+        self.dstorage_bytes_read.load(Ordering::Relaxed)
+    }
+
+    pub fn get_save_provider_root(&self, h: Handle) -> Option<PathBuf> {
+        match self.handles.lock().unwrap().get(&(h as usize)) {
+            Some(KernelObject::SaveProvider { root_dir }) => Some(root_dir.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn get_save_container(&self, h: Handle) -> Option<SaveContainerState> {
+        match self.handles.lock().unwrap().get(&(h as usize)) {
+            Some(KernelObject::SaveContainer(c)) => Some(c.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn stage_save_blob_write(&self, update: Handle, name: String, data: Vec<u8>) -> bool {
+        if let Some(KernelObject::SaveUpdate(upd)) =
+            self.handles.lock().unwrap().get_mut(&(update as usize))
+        {
+            upd.writes.insert(name, data);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn commit_save_update(&self, update: Handle) -> std::io::Result<usize> {
+        let mut map = self.handles.lock().unwrap();
+        let Some(KernelObject::SaveUpdate(upd)) = map.get_mut(&(update as usize)) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid save update handle",
+            ));
+        };
+        fs::create_dir_all(&upd.container_dir)?;
+        let mut count = 0usize;
+        for (name, data) in std::mem::take(&mut upd.writes) {
+            fs::write(upd.container_dir.join(name), data)?;
+            count += 1;
+        }
+        for del in std::mem::take(&mut upd.deletes) {
+            let _ = fs::remove_file(upd.container_dir.join(del));
+        }
+        Ok(count)
+    }
+
+    // -----------------------------------------------------------------------
+    // Core Runtime State
+    // -----------------------------------------------------------------------
 
     pub fn trace(&self, msg: impl Into<String>) {
         let s = msg.into();
@@ -300,9 +432,7 @@ impl GuestRuntime {
 
     pub fn realloc_virtual(&self, old_ptr: *mut u8, new_size: usize) -> *mut u8 {
         let mut map = self.heap_allocs.lock().unwrap();
-        let mut buf = map
-            .remove(&(old_ptr as usize))
-            .unwrap_or_default();
+        let mut buf = map.remove(&(old_ptr as usize)).unwrap_or_default();
         buf.resize(new_size.max(16), 0);
         let ptr = buf.as_mut_ptr();
         map.insert(ptr as usize, buf);
@@ -356,7 +486,6 @@ impl GuestRuntime {
     }
 
     pub fn current_thread_u32() -> u32 {
-        // Stable non-zero 32-bit hash of the OS ThreadId
         let id = thread::current().id();
         let dbg = format!("{id:?}");
         let mut h: u32 = 2166136261;
@@ -380,8 +509,6 @@ fn session_lock() -> &'static Mutex<()> {
 }
 
 /// RAII guard that binds a `GuestRuntime` as the active global HLE context.
-/// Serializes distinct guest sessions across threads while allowing worker
-/// threads spawned by the active guest to access `current_runtime()` concurrently.
 pub struct RuntimeGuard {
     _session: std::sync::MutexGuard<'static, ()>,
 }

@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 xsx-abi = { workspace = true }
+xsx-d3d12 = { workspace = true }
 xsx-loader = { workspace = true }

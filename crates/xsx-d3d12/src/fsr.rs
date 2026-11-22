@@ -205,6 +205,48 @@ impl FsrDispatchConstants {
     }
 }
 
+/// Optional temporal inputs supplied by titles or hooks for FSR 2 / FSR 3 temporal upscaling.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FsrTemporalInputs {
+    pub depth_resource_id: Option<u64>,
+    pub motion_vectors_resource_id: Option<u64>,
+    pub exposure: f32,
+    pub delta_time_ms: f32,
+    pub reset_history: bool,
+}
+
+/// Hardware D3D12 compute dispatch plan for executing FSR EASU + RCAS on GPU.
+#[derive(Debug, Clone, Copy)]
+pub struct FsrComputePlan {
+    pub constants: FsrDispatchConstants,
+    pub easu_groups: (u32, u32, u32),
+    pub rcas_groups: (u32, u32, u32),
+    pub run_easu: bool,
+    pub run_rcas: bool,
+    pub temporal: FsrTemporalInputs,
+}
+
+impl FsrComputePlan {
+    pub fn build(
+        cfg: &FsrConfig,
+        in_w: u32,
+        in_h: u32,
+        frame_index: u64,
+        temporal: FsrTemporalInputs,
+    ) -> Self {
+        let (out_w, out_h) = cfg.resolve_output_size(in_w, in_h);
+        let groups = FsrDispatchConstants::thread_groups_16x16(out_w, out_h);
+        Self {
+            constants: FsrDispatchConstants::new(in_w, in_h, out_w, out_h, cfg.sharpness, frame_index),
+            easu_groups: groups,
+            rcas_groups: groups,
+            run_easu: cfg.is_active() && (out_w != in_w || out_h != in_h),
+            run_rcas: cfg.is_active() && cfg.enable_rcas,
+            temporal,
+        }
+    }
+}
+
 /// Halton(2, 3) sub-pixel jitter sequence in `[-0.5, +0.5]` pixel units for FSR 2/3 temporal passes.
 pub fn halton_jitter_2_3(frame_index: u64, render_w: u32, render_h: u32) -> (f32, f32) {
     let phase = (frame_index % 16) + 1;

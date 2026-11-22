@@ -20,7 +20,7 @@ jobs:
         run: cargo build --workspace
       - name: Run workspace tests
         run: cargo test --workspace -- --nocapture
-      - name: Run CLI end-to-end smoke tests (Phase 1 + Phase 2 + default FSR)
+      - name: Run CLI end-to-end smoke tests (Phases 1-4 + default FSR)
         shell: bash
         run: |
           cargo run -p xsxemu -- gen-sample hello_xsx.exe
@@ -33,3 +33,7 @@ jobs:
           cargo run -p xsxemu -- run phase2_out/phase2_xsx.exe --backend software --trace --force-relocate --scratch-dir phase2_scratch --dump-frame fsr_frame.bmp
           test -s fsr_frame.bmp
           test -s phase2_scratch/phase2_check.txt
+          cargo run -p xsxemu -- gen-fullstack fullstack_out
+          cargo run -p xsxemu -- run fullstack_out/full_stack_xsx.exe --backend software --trace --force-relocate --scratch-dir fullstack_scratch --dump-frame fullstack_fsr.bmp
+          test -s fullstack_fsr.bmp
+          test -s fullstack_scratch/saves/slot0/player.sav
