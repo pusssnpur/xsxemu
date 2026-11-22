@@ -167,6 +167,13 @@ impl ShaderContainer {
 }
 
 /// Compute Microsoft's 16-byte DXBC MD5-variant container hash over `payload` (`dxbc[20..]`).
+///
+/// Matches the exact `d3dcompiler` / `d3d12.dll` container verification digest:
+/// full 64-byte MD5 blocks are compressed first; for the final block, if `rem < 56`,
+/// the remaining bytes are placed at offset 4 (`block[4..4+rem]`) with `0x80` at `4+rem`,
+/// `m[0] = bit_len`, and `m[15] = (bit_len >> 2) | 1`. If `rem >= 56`, the remaining bytes
+/// are placed at offset 0 with `0x80` at `rem`, compressed, and followed by a final block
+/// holding only `m[0] = bit_len` and `m[15] = (bit_len >> 2) | 1`.
 pub fn compute_dxbc_hash(payload: &[u8]) -> [u8; 16] {
     let mut state: [u32; 4] = [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
     let full_blocks = payload.len() / 64;
@@ -178,21 +185,19 @@ pub fn compute_dxbc_hash(payload: &[u8]) -> [u8; 16] {
     let rem = &payload[full_blocks * 64..];
     let bit_len = (payload.len() as u32).wrapping_mul(8);
     let mut tail = [0u8; 64];
-    tail[..rem.len()].copy_from_slice(rem);
-    tail[rem.len()] = 0x80;
 
     if rem.len() >= 56 {
+        tail[..rem.len()].copy_from_slice(rem);
+        tail[rem.len()] = 0x80;
         md5_compress(&mut state, &tail);
         tail = [0u8; 64];
-    }
-    // Microsoft DXBC MD5 padding places bit length in word 0 (if separate final block) or word 14,
-    // and `(bit_len >> 1) | 1` in word 15 for DXBC verification.
-    if rem.len() >= 56 {
-        tail[0..4].copy_from_slice(&bit_len.to_le_bytes());
     } else {
-        tail[56..60].copy_from_slice(&bit_len.to_le_bytes());
+        tail[4..4 + rem.len()].copy_from_slice(rem);
+        tail[4 + rem.len()] = 0x80;
     }
-    tail[60..64].copy_from_slice(&((bit_len >> 1) | 1).to_le_bytes());
+
+    tail[0..4].copy_from_slice(&bit_len.to_le_bytes());
+    tail[60..64].copy_from_slice(&((bit_len >> 2) | 1).to_le_bytes());
     md5_compress(&mut state, &tail);
 
     let mut out = [0u8; 16];

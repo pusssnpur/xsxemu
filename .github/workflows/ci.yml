@@ -39,3 +39,6 @@ jobs:
           test -s fullstack_audio.wav
           test -s fullstack_scratch/saves/slot0/player.sav
           cargo run -p xsxemu -- bench-fsr --width 320 --height 180 --fsr quality
+          cargo run -p xsxemu -- gen-realgame realgame_out
+          cargo run -p xsxemu -- run realgame_out/realgame_xsx.exe --dry-run --trace-jsonl realgame_dry.jsonl
+          test -s realgame_dry.jsonl

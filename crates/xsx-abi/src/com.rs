@@ -7,12 +7,27 @@ pub type HResult = i32;
 
 pub const S_OK: HResult = 0x0000_0000_u32 as i32;
 pub const S_FALSE: HResult = 0x0000_0001_u32 as i32;
+pub const E_PENDING: HResult = 0x8000_000A_u32 as i32;
 pub const E_NOTIMPL: HResult = 0x8000_4001_u32 as i32;
 pub const E_NOINTERFACE: HResult = 0x8000_4002_u32 as i32;
 pub const E_POINTER: HResult = 0x8000_4003_u32 as i32;
+pub const E_ABORT: HResult = 0x8000_4004_u32 as i32;
 pub const E_FAIL: HResult = 0x8000_4005_u32 as i32;
 pub const E_OUTOFMEMORY: HResult = 0x8007_000E_u32 as i32;
+pub const E_NOT_SUPPORTED: HResult = 0x8007_0032_u32 as i32; // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
 pub const E_INVALIDARG: HResult = 0x8007_0057_u32 as i32;
+pub const E_INSUFFICIENT_BUFFER: HResult = 0x8007_007A_u32 as i32; // HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)
+pub const E_WAIT_TIMEOUT: HResult = 0x8007_0102_u32 as i32; // HRESULT_FROM_WIN32(WAIT_TIMEOUT)
+pub const E_INVALID_STATE: HResult = 0x8007_139F_u32 as i32; // HRESULT_FROM_WIN32(ERROR_INVALID_STATE)
+
+#[inline]
+pub const fn hresult_from_win32(code: u32) -> HResult {
+    if code == 0 {
+        0
+    } else {
+        ((code & 0xFFFF) | 0x8007_0000) as i32
+    }
+}
 
 #[inline]
 pub const fn succeeded(hr: HResult) -> bool {
@@ -124,6 +139,25 @@ pub const IID_IXAUDIO2: Guid =
 
 pub const IID_IGAMEINPUT: Guid =
     Guid::new(0x11BE_2A7E, 0x4254, 0x445A, [0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18]);
+
+pub const IID_ID3D12DEVICE_CHILD: Guid =
+    Guid::new(0x905D_B94B, 0xA00C, 0x4140, [0x9D, 0xF5, 0x2B, 0x64, 0xCA, 0x9E, 0xA3, 0x57]);
+
+pub const IID_ID3D12PAGEABLE: Guid =
+    Guid::new(0x63EE_58FB, 0x1268, 0x4835, [0x86, 0xDA, 0xF0, 0x08, 0xCE, 0x62, 0xF0, 0xD6]);
+
+pub const IID_ID3D12FENCE1: Guid =
+    Guid::new(0x4336_85FE, 0xE22B, 0x4CA0, [0xA8, 0xDB, 0xB5, 0xB4, 0xF4, 0xDD, 0x0E, 0x4A]);
+
+// Real xgameruntime.dll QueryApiImpl COM singleton class IDs (GDK runtime thunks).
+pub const CLSID_XTHREADING_IMPL: Guid =
+    Guid::new(0x073B_7DCB, 0x1FCF, 0x4030, [0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28]);
+
+pub const CLSID_XERROR_IMPL: Guid =
+    Guid::new(0x8CA4_67F7, 0x22E8, 0x4096, [0x84, 0x56, 0xBB, 0x8A, 0xA1, 0x3F, 0x79, 0xD8]);
+
+pub const CLSID_XNETWORKING_IMPL: Guid =
+    Guid::new(0x37E5_6907, 0x2F10, 0x41E8, [0xB7, 0x2F, 0x36, 0xED, 0xB1, 0x85, 0x33, 0x1A]);
 
 #[cfg(test)]
 mod tests {

@@ -601,6 +601,102 @@ pub struct ID3D12FenceXVtbl {
     ) -> HResult,
 }
 
+/// Xbox root signature high-byte flag mask (observed `0x0300_0000` on Series X, rejected by PC `d3d12.dll`).
+pub const XBOX_ROOT_SIGNATURE_FLAG_HIGH_BYTE: u32 = 0xFF00_0000;
+
+pub const D3D_ROOT_SIGNATURE_VERSION_1_0: u32 = 1;
+pub const D3D_ROOT_SIGNATURE_VERSION_1_1: u32 = 2;
+pub const D3D_ROOT_SIGNATURE_VERSION_1_2: u32 = 3;
+
+/// `D3D12_STATIC_SAMPLER_DESC` (52 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct D3D12StaticSamplerDesc {
+    pub filter: u32,
+    pub address_u: u32,
+    pub address_v: u32,
+    pub address_w: u32,
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: u32,
+    pub comparison_func: u32,
+    pub border_color: u32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub shader_register: u32,
+    pub register_space: u32,
+    pub shader_visibility: u32,
+}
+
+/// `D3D12_STATIC_SAMPLER_DESC1` (56 bytes — adds trailing `flags` in Root Signature 1.2).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct D3D12StaticSamplerDesc1 {
+    pub base: D3D12StaticSamplerDesc,
+    pub flags: u32,
+}
+
+/// `D3D12_ROOT_SIGNATURE_DESC` / `DESC1` / `DESC2` (40 bytes on Win64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12RootSignatureDesc {
+    pub num_parameters: u32,
+    pub _pad0: u32,
+    pub p_parameters: *const c_void,
+    pub num_static_samplers: u32,
+    pub _pad1: u32,
+    pub p_static_samplers: *const c_void,
+    pub flags: u32,
+    pub _pad2: u32,
+}
+
+impl Default for D3D12RootSignatureDesc {
+    fn default() -> Self {
+        Self {
+            num_parameters: 0,
+            _pad0: 0,
+            p_parameters: core::ptr::null(),
+            num_static_samplers: 0,
+            _pad1: 0,
+            p_static_samplers: core::ptr::null(),
+            flags: 0,
+            _pad2: 0,
+        }
+    }
+}
+
+/// `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` (48 bytes on Win64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12VersionedRootSignatureDesc {
+    pub version: u32,
+    pub _pad: u32,
+    pub desc: D3D12RootSignatureDesc,
+}
+
+/// Measured Xbox Series X `ID3D12Device` slot 67 (`DeserializeComputePipelineStateX`) descriptor
+/// used by `amd_fidelityfx_upscaler_xbox.dll` to submit native RDNA2/FSPX compute pipelines (72 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct XboxNativeComputePipelineStateDesc {
+    pub root_signature: *mut c_void, // +0x00
+    pub kind0: *const c_void,        // +0x08: dispatch state (28 bytes)
+    pub kind0_size: u64,             // +0x10
+    pub kind1: *const c_void,        // +0x18: metadata (20 bytes)
+    pub kind1_size: u64,             // +0x20
+    pub kind6: *const c_void,        // +0x28: native RDNA2 shader program
+    pub kind6_size: u64,             // +0x30
+    pub kind7: *const c_void,        // +0x38: resource/hash records
+    pub kind7_size: u64,             // +0x40
+}
+
+/// `D3D12XBOX_PRESENT_PARAMETERS` (tearing threshold & flags).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12XboxPresentParameters {
+    pub immediate_threshold_percent: f32,
+    pub flags: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +715,10 @@ mod tests {
         assert_eq!(size_of::<SimpleVertex>(), 28);
         assert_eq!(size_of::<DxgiSwapChainDesc1>(), 48);
         assert_eq!(size_of::<D3D12ShaderBytecode>(), 16);
+        assert_eq!(size_of::<D3D12StaticSamplerDesc>(), 52);
+        assert_eq!(size_of::<D3D12StaticSamplerDesc1>(), 56);
+        assert_eq!(size_of::<D3D12RootSignatureDesc>(), 40);
+        assert_eq!(size_of::<D3D12VersionedRootSignatureDesc>(), 48);
+        assert_eq!(size_of::<XboxNativeComputePipelineStateDesc>(), 72);
     }
 }

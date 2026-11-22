@@ -9,6 +9,7 @@
 pub mod full_stack_suite;
 pub mod pe_builder;
 pub mod phase2_suite;
+pub mod real_game_suite;
 pub mod x64_asm;
 
 pub use full_stack_suite::{
@@ -17,4 +18,7 @@ pub use full_stack_suite::{
 pub use pe_builder::build_hello_xsx_pe;
 pub use phase2_suite::{
     build_helper_dll_pe, build_phase2_xsx_pe, HELPER_MAGIC, PHASE2_FILE_PAYLOAD, WORKER_EXIT_CODE,
+};
+pub use real_game_suite::{
+    build_real_game_xsx_pe, REALGAME_EXIT_CODE, REALGAME_OVERLAY_CONFIG, REALGAME_PKG_CONFIG,
 };

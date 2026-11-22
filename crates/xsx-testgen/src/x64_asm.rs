@@ -136,6 +136,11 @@ impl X64Assembler {
         self.emit_rip_disp32(iat_rva);
     }
 
+    /// `call rax` (for calling dynamically resolved `GetProcAddress` pointers).
+    pub fn call_rax(&mut self) {
+        self.code.extend_from_slice(&[0xFF, 0xD0]);
+    }
+
     /// Call COM vtable slot `slot_index` on the interface pointer currently in `RCX`:
     /// `mov rax, [rcx]; call qword ptr [rax + slot_index*8]`.
     pub fn call_com_rcx_slot(&mut self, slot_index: u32) {

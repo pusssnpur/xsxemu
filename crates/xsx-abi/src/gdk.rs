@@ -248,6 +248,145 @@ pub struct SystemInfo {
 
 pub const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
 
+/// `XAsyncBlock` from Microsoft GDK `XAsync.h` (56 bytes on Win64).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct XAsyncBlock {
+    pub queue: Handle,
+    pub context: *mut c_void,
+    pub callback: Option<unsafe extern "win64" fn(async_block: *mut XAsyncBlock)>,
+    pub internal: [u8; 32],
+}
+
+/// `XTaskQueueCallback` signature.
+pub type XTaskQueueCallback =
+    unsafe extern "win64" fn(context: *mut c_void, canceled: bool);
+
+/// `XTaskQueueRegistrationToken` (8 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XTaskQueueRegistrationToken {
+    pub token: u64,
+}
+
+/// `InitializeApiImplEx2` 4th argument options struct.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ApiImplOptions {
+    pub unknown: u32,
+    pub is_inline: i32,
+    pub game_config: *const u8,
+}
+
+/// `XNetworkingConnectivityHint` from GDK `XNetworking.h` (16 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XNetworkingConnectivityHint {
+    pub connectivity_level_hint: u32,
+    pub connectivity_cost_hint: u32,
+    pub iana_interface_type: u32,
+    pub network_initialized: u8,
+    pub approaching_data_limit: u8,
+    pub over_data_limit: u8,
+    pub roaming: u8,
+}
+
+/// Win64 `MEMORY_BASIC_INFORMATION` (48 bytes), prefix of 64-byte `XMemVirtualQuery` output.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryBasicInformation {
+    pub base_address: usize,
+    pub allocation_base: usize,
+    pub allocation_protect: u32,
+    pub partition_id: u16,
+    pub _pad0: u16,
+    pub region_size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub r#type: u32,
+    pub _pad1: u32,
+}
+
+/// Win32 `WIN32_FILE_ATTRIBUTE_DATA` (36 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Win32FileAttributeData {
+    pub dw_file_attributes: u32,
+    pub ft_creation_time: FileTime,
+    pub ft_last_access_time: FileTime,
+    pub ft_last_write_time: FileTime,
+    pub n_file_size_high: u32,
+    pub n_file_size_low: u32,
+}
+
+/// Win32 `WIN32_FIND_DATAA` (320 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Win32FindDataA {
+    pub dw_file_attributes: u32,
+    pub ft_creation_time: FileTime,
+    pub ft_last_access_time: FileTime,
+    pub ft_last_write_time: FileTime,
+    pub n_file_size_high: u32,
+    pub n_file_size_low: u32,
+    pub dw_reserved0: u32,
+    pub dw_reserved1: u32,
+    pub c_file_name: [u8; 260],
+    pub c_alternate_file_name: [u8; 14],
+    pub _pad: [u8; 2],
+}
+
+impl Default for Win32FindDataA {
+    fn default() -> Self {
+        Self {
+            dw_file_attributes: 0,
+            ft_creation_time: FileTime::default(),
+            ft_last_access_time: FileTime::default(),
+            ft_last_write_time: FileTime::default(),
+            n_file_size_high: 0,
+            n_file_size_low: 0,
+            dw_reserved0: 0,
+            dw_reserved1: 0,
+            c_file_name: [0; 260],
+            c_alternate_file_name: [0; 14],
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// Win32 `WIN32_FIND_DATAW` (592 bytes).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Win32FindDataW {
+    pub dw_file_attributes: u32,
+    pub ft_creation_time: FileTime,
+    pub ft_last_access_time: FileTime,
+    pub ft_last_write_time: FileTime,
+    pub n_file_size_high: u32,
+    pub n_file_size_low: u32,
+    pub dw_reserved0: u32,
+    pub dw_reserved1: u32,
+    pub c_file_name: [u16; 260],
+    pub c_alternate_file_name: [u16; 14],
+}
+
+impl Default for Win32FindDataW {
+    fn default() -> Self {
+        Self {
+            dw_file_attributes: 0,
+            ft_creation_time: FileTime::default(),
+            ft_last_access_time: FileTime::default(),
+            ft_last_write_time: FileTime::default(),
+            n_file_size_high: 0,
+            n_file_size_low: 0,
+            dw_reserved0: 0,
+            dw_reserved1: 0,
+            c_file_name: [0; 260],
+            c_alternate_file_name: [0; 14],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +400,11 @@ mod tests {
         assert_eq!(core::mem::size_of::<FileTime>(), 8);
         assert_eq!(core::mem::size_of::<TimeZoneInformation>(), 172);
         assert_eq!(core::mem::size_of::<SystemInfo>(), 48);
+        assert_eq!(core::mem::size_of::<XAsyncBlock>(), 56);
+        assert_eq!(core::mem::size_of::<XNetworkingConnectivityHint>(), 16);
+        assert_eq!(core::mem::size_of::<MemoryBasicInformation>(), 48);
+        assert_eq!(core::mem::size_of::<Win32FileAttributeData>(), 36);
+        assert_eq!(core::mem::size_of::<Win32FindDataA>(), 320);
+        assert_eq!(core::mem::size_of::<Win32FindDataW>(), 592);
     }
 }

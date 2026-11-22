@@ -13,28 +13,33 @@ use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use xsx_abi::gdk::{
     CriticalSection, FileTime, Handle, SrwLock, SystemInfo, SystemTime, ThreadStartRoutine,
-    TimeZoneInformation, TitleMemoryStatus, CREATE_ALWAYS, CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_CURRENT, FILE_END, GENERIC_READ, GENERIC_WRITE,
-    INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE, OPEN_ALWAYS, OPEN_EXISTING,
-    PROCESSOR_ARCHITECTURE_AMD64, TRUNCATE_EXISTING, WAIT_FAILED,
+    TimeZoneInformation, TitleMemoryStatus, Win32FileAttributeData, Win32FindDataA,
+    Win32FindDataW, CREATE_ALWAYS, CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_BEGIN, FILE_CURRENT, FILE_END, GENERIC_READ, GENERIC_WRITE, INVALID_FILE_ATTRIBUTES,
+    INVALID_HANDLE_VALUE, OPEN_ALWAYS, OPEN_EXISTING, PROCESSOR_ARCHITECTURE_AMD64,
+    TRUNCATE_EXISTING, WAIT_FAILED,
 };
 use xsx_loader::ImportSymbol;
 
-use crate::registry::ModuleRegistry;
+use crate::registry::{normalize_dll, ModuleRegistry};
 use crate::rtc::{filetime_to_systemtime, systemtime_to_filetime};
-use crate::runtime::{current_runtime, EventState, GuestRuntime, KernelObject, ThreadState};
+use crate::runtime::{
+    current_runtime, EventState, FindSearchState, GuestRuntime, KernelObject, ThreadState,
+};
+use crate::vfs::VfsDirEntry;
 
 const PROCESS_HEAP_HANDLE: Handle = 0xDEAD_BEE0usize as Handle;
 
 pub fn register(reg: &mut ModuleRegistry) {
     // Diagnostics, timing & Real-Time Clock (RTC)
     reg.register_export("kernelx.dll", "OutputDebugStringA", hle_output_debug_string_a as *const () as usize);
+    reg.register_export("kernelx.dll", "OutputDebugStringW", hle_output_debug_string_w as *const () as usize);
     reg.register_export("kernelx.dll", "QueryPerformanceCounter", hle_query_performance_counter as *const () as usize);
     reg.register_export("kernelx.dll", "QueryPerformanceFrequency", hle_query_performance_frequency as *const () as usize);
     reg.register_export("kernelx.dll", "GetTickCount64", hle_get_tick_count_64 as *const () as usize);
@@ -74,7 +79,7 @@ pub fn register(reg: &mut ModuleRegistry) {
     reg.register_export("kernelx.dll", "LeaveCriticalSection", hle_leave_critical_section as *const () as usize);
     reg.register_export("kernelx.dll", "DeleteCriticalSection", hle_delete_critical_section as *const () as usize);
 
-    // File I/O (Virtual Xbox G:\, T:\, D:\, S:\)
+    // File I/O (Virtual Xbox GAME:\, G:\, T:\, D:\, S:\ with CoW overlay)
     reg.register_export("kernelx.dll", "CreateFileA", hle_create_file_a as *const () as usize);
     reg.register_export("kernelx.dll", "CreateFileW", hle_create_file_w as *const () as usize);
     reg.register_export("kernelx.dll", "ReadFile", hle_read_file as *const () as usize);
@@ -83,6 +88,19 @@ pub fn register(reg: &mut ModuleRegistry) {
     reg.register_export("kernelx.dll", "GetFileSizeEx", hle_get_file_size_ex as *const () as usize);
     reg.register_export("kernelx.dll", "GetFileAttributesA", hle_get_file_attributes_a as *const () as usize);
     reg.register_export("kernelx.dll", "GetFileAttributesW", hle_get_file_attributes_w as *const () as usize);
+    reg.register_export("kernelx.dll", "GetFileAttributesExA", hle_get_file_attributes_ex_a as *const () as usize);
+    reg.register_export("kernelx.dll", "GetFileAttributesExW", hle_get_file_attributes_ex_w as *const () as usize);
+    reg.register_export("kernelx.dll", "DeleteFileA", hle_delete_file_a as *const () as usize);
+    reg.register_export("kernelx.dll", "DeleteFileW", hle_delete_file_w as *const () as usize);
+    reg.register_export("kernelx.dll", "CreateDirectoryA", hle_create_directory_a as *const () as usize);
+    reg.register_export("kernelx.dll", "CreateDirectoryW", hle_create_directory_w as *const () as usize);
+    reg.register_export("kernelx.dll", "RemoveDirectoryA", hle_remove_directory_a as *const () as usize);
+    reg.register_export("kernelx.dll", "RemoveDirectoryW", hle_remove_directory_w as *const () as usize);
+    reg.register_export("kernelx.dll", "FindFirstFileA", hle_find_first_file_a as *const () as usize);
+    reg.register_export("kernelx.dll", "FindFirstFileW", hle_find_first_file_w as *const () as usize);
+    reg.register_export("kernelx.dll", "FindNextFileA", hle_find_next_file_a as *const () as usize);
+    reg.register_export("kernelx.dll", "FindNextFileW", hle_find_next_file_w as *const () as usize);
+    reg.register_export("kernelx.dll", "FindClose", hle_find_close as *const () as usize);
 
     // Memory, Heap & Win32 TLS slots
     reg.register_export("kernelx.dll", "VirtualAlloc", hle_virtual_alloc as *const () as usize);
@@ -98,10 +116,15 @@ pub fn register(reg: &mut ModuleRegistry) {
     reg.register_export("kernelx.dll", "TlsSetValue", hle_tls_set_value as *const () as usize);
     reg.register_export("kernelx.dll", "TlsFree", hle_tls_free as *const () as usize);
 
-    // Runtime module queries
+    // Runtime module queries & pseudo-handle owned-DLL resolution
     reg.register_export("kernelx.dll", "GetModuleHandleA", hle_get_module_handle_a as *const () as usize);
+    reg.register_export("kernelx.dll", "GetModuleHandleW", hle_get_module_handle_w as *const () as usize);
     reg.register_export("kernelx.dll", "GetProcAddress", hle_get_proc_address as *const () as usize);
     reg.register_export("kernelx.dll", "LoadLibraryA", hle_load_library_a as *const () as usize);
+    reg.register_export("kernelx.dll", "LoadLibraryW", hle_load_library_w as *const () as usize);
+    reg.register_export("kernelx.dll", "LoadLibraryExA", hle_load_library_ex_a as *const () as usize);
+    reg.register_export("kernelx.dll", "LoadLibraryExW", hle_load_library_ex_w as *const () as usize);
+    reg.register_export("kernelx.dll", "FreeLibrary", hle_free_library as *const () as usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +140,17 @@ unsafe extern "win64" fn hle_output_debug_string_a(lp_output_string: *const c_ch
         .into_owned();
     if let Some(rt) = current_runtime() {
         rt.trace(format!("kernelx!OutputDebugStringA({msg:?})"));
+        rt.log_debug_string(msg);
+    }
+}
+
+unsafe extern "win64" fn hle_output_debug_string_w(lp_output_string: *const u16) {
+    if lp_output_string.is_null() {
+        return;
+    }
+    let msg = read_utf16_cstr(lp_output_string);
+    if let Some(rt) = current_runtime() {
+        rt.trace(format!("kernelx!OutputDebugStringW({msg:?})"));
         rt.log_debug_string(msg);
     }
 }
@@ -431,19 +465,41 @@ fn open_guest_file(guest_path: &str, access: u32, disposition: u32) -> Handle {
         return INVALID_HANDLE_VALUE;
     };
     let _ = rt.vfs.ensure_roots();
-    let Some(host_path) = rt.vfs.resolve_guest_path(guest_path) else {
-        rt.set_last_error(3); // ERROR_PATH_NOT_FOUND
-        return INVALID_HANDLE_VALUE;
-    };
-
-    if let Some(parent) = host_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
 
     let read = (access & GENERIC_READ) != 0 || access == 0;
-    let write = (access & GENERIC_WRITE) != 0;
+    let write = (access & GENERIC_WRITE) != 0
+        || matches!(
+            disposition,
+            CREATE_NEW | CREATE_ALWAYS | OPEN_ALWAYS | TRUNCATE_EXISTING
+        );
+
+    let host_path = if write {
+        let copy_up = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
+        match rt.vfs.resolve_for_write(guest_path, copy_up) {
+            Some(p) => p,
+            None => {
+                rt.set_last_error(3); // ERROR_PATH_NOT_FOUND
+                return INVALID_HANDLE_VALUE;
+            }
+        }
+    } else {
+        match rt.vfs.resolve_for_read(guest_path) {
+            Some(p) => p,
+            None => {
+                rt.set_last_error(2); // ERROR_FILE_NOT_FOUND
+                return INVALID_HANDLE_VALUE;
+            }
+        }
+    };
+
+    if write {
+        if let Some(parent) = host_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+
     let mut opts = OpenOptions::new();
-    opts.read(read).write(write);
+    opts.read(read).write((access & GENERIC_WRITE) != 0);
 
     match disposition {
         CREATE_NEW => {
@@ -625,7 +681,7 @@ fn file_attributes_for_guest_path(path: &str) -> u32 {
     let Some(rt) = current_runtime() else {
         return INVALID_FILE_ATTRIBUTES;
     };
-    let Some(host_path) = rt.vfs.resolve_guest_path(path) else {
+    let Some(host_path) = rt.vfs.resolve_for_read(path) else {
         return INVALID_FILE_ATTRIBUTES;
     };
     match fs::metadata(host_path) {
@@ -649,6 +705,262 @@ unsafe extern "win64" fn hle_get_file_attributes_w(lp_file_name: *const u16) -> 
     }
     let path = read_utf16_cstr(lp_file_name);
     file_attributes_for_guest_path(&path)
+}
+
+unsafe fn fill_file_attr_ex(path: &str, out: *mut Win32FileAttributeData) -> i32 {
+    if out.is_null() {
+        return 0;
+    }
+    let Some(rt) = current_runtime() else {
+        return 0;
+    };
+    let Some(host_path) = rt.vfs.resolve_for_read(path) else {
+        rt.set_last_error(2);
+        return 0;
+    };
+    let Ok(meta) = fs::metadata(host_path) else {
+        rt.set_last_error(2);
+        return 0;
+    };
+    let sz = meta.len();
+    let now = rt.rtc().now_filetime_utc();
+    *out = Win32FileAttributeData {
+        dw_file_attributes: if meta.is_dir() {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        },
+        ft_creation_time: now,
+        ft_last_access_time: now,
+        ft_last_write_time: now,
+        n_file_size_high: (sz >> 32) as u32,
+        n_file_size_low: sz as u32,
+    };
+    1
+}
+
+unsafe extern "win64" fn hle_get_file_attributes_ex_a(
+    lp_file_name: *const c_char,
+    _info_level: u32,
+    lp_file_info: *mut Win32FileAttributeData,
+) -> i32 {
+    if lp_file_name.is_null() {
+        return 0;
+    }
+    let path = CStr::from_ptr(lp_file_name).to_string_lossy();
+    fill_file_attr_ex(&path, lp_file_info)
+}
+
+unsafe extern "win64" fn hle_get_file_attributes_ex_w(
+    lp_file_name: *const u16,
+    _info_level: u32,
+    lp_file_info: *mut Win32FileAttributeData,
+) -> i32 {
+    if lp_file_name.is_null() {
+        return 0;
+    }
+    let path = read_utf16_cstr(lp_file_name);
+    fill_file_attr_ex(&path, lp_file_info)
+}
+
+unsafe extern "win64" fn hle_delete_file_a(lp_file_name: *const c_char) -> i32 {
+    if lp_file_name.is_null() {
+        return 0;
+    }
+    let path = CStr::from_ptr(lp_file_name).to_string_lossy();
+    let ok = current_runtime()
+        .map(|rt| rt.vfs.delete_guest_file(&path))
+        .unwrap_or(false);
+    i32::from(ok)
+}
+
+unsafe extern "win64" fn hle_delete_file_w(lp_file_name: *const u16) -> i32 {
+    if lp_file_name.is_null() {
+        return 0;
+    }
+    let path = read_utf16_cstr(lp_file_name);
+    let ok = current_runtime()
+        .map(|rt| rt.vfs.delete_guest_file(&path))
+        .unwrap_or(false);
+    i32::from(ok)
+}
+
+unsafe extern "win64" fn hle_create_directory_a(
+    lp_path_name: *const c_char,
+    _lp_security: *mut c_void,
+) -> i32 {
+    if lp_path_name.is_null() {
+        return 0;
+    }
+    let path = CStr::from_ptr(lp_path_name).to_string_lossy();
+    let ok = current_runtime()
+        .map(|rt| rt.vfs.create_guest_dir(&path))
+        .unwrap_or(false);
+    i32::from(ok)
+}
+
+unsafe extern "win64" fn hle_create_directory_w(
+    lp_path_name: *const u16,
+    _lp_security: *mut c_void,
+) -> i32 {
+    if lp_path_name.is_null() {
+        return 0;
+    }
+    let path = read_utf16_cstr(lp_path_name);
+    let ok = current_runtime()
+        .map(|rt| rt.vfs.create_guest_dir(&path))
+        .unwrap_or(false);
+    i32::from(ok)
+}
+
+unsafe extern "win64" fn hle_remove_directory_a(lp_path_name: *const c_char) -> i32 {
+    if lp_path_name.is_null() {
+        return 0;
+    }
+    let path = CStr::from_ptr(lp_path_name).to_string_lossy();
+    let ok = current_runtime()
+        .map(|rt| rt.vfs.remove_guest_dir(&path))
+        .unwrap_or(false);
+    i32::from(ok)
+}
+
+unsafe extern "win64" fn hle_remove_directory_w(lp_path_name: *const u16) -> i32 {
+    if lp_path_name.is_null() {
+        return 0;
+    }
+    let path = read_utf16_cstr(lp_path_name);
+    let ok = current_runtime()
+        .map(|rt| rt.vfs.remove_guest_dir(&path))
+        .unwrap_or(false);
+    i32::from(ok)
+}
+
+fn fill_find_data_a(entry: &VfsDirEntry, out: &mut Win32FindDataA) {
+    *out = Win32FindDataA::default();
+    out.dw_file_attributes = if entry.is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    out.n_file_size_high = (entry.size >> 32) as u32;
+    out.n_file_size_low = entry.size as u32;
+    let bytes = entry.name.as_bytes();
+    let n = bytes.len().min(out.c_file_name.len() - 1);
+    out.c_file_name[..n].copy_from_slice(&bytes[..n]);
+    out.c_file_name[n] = 0;
+}
+
+fn fill_find_data_w(entry: &VfsDirEntry, out: &mut Win32FindDataW) {
+    *out = Win32FindDataW::default();
+    out.dw_file_attributes = if entry.is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    out.n_file_size_high = (entry.size >> 32) as u32;
+    out.n_file_size_low = entry.size as u32;
+    let units: Vec<u16> = entry.name.encode_utf16().collect();
+    let n = units.len().min(out.c_file_name.len() - 1);
+    out.c_file_name[..n].copy_from_slice(&units[..n]);
+    out.c_file_name[n] = 0;
+}
+
+unsafe extern "win64" fn hle_find_first_file_a(
+    lp_pattern: *const c_char,
+    lp_find_data: *mut Win32FindDataA,
+) -> Handle {
+    if lp_pattern.is_null() || lp_find_data.is_null() {
+        return INVALID_HANDLE_VALUE;
+    }
+    let Some(rt) = current_runtime() else {
+        return INVALID_HANDLE_VALUE;
+    };
+    let pat = CStr::from_ptr(lp_pattern).to_string_lossy();
+    let entries = rt.vfs.find_guest_files(&pat);
+    if entries.is_empty() {
+        rt.set_last_error(2);
+        return INVALID_HANDLE_VALUE;
+    }
+    fill_find_data_a(&entries[0], &mut *lp_find_data);
+    rt.insert_handle(KernelObject::FindSearch(Arc::new(Mutex::new(
+        FindSearchState { entries, cursor: 1 },
+    ))))
+}
+
+unsafe extern "win64" fn hle_find_first_file_w(
+    lp_pattern: *const u16,
+    lp_find_data: *mut Win32FindDataW,
+) -> Handle {
+    if lp_pattern.is_null() || lp_find_data.is_null() {
+        return INVALID_HANDLE_VALUE;
+    }
+    let Some(rt) = current_runtime() else {
+        return INVALID_HANDLE_VALUE;
+    };
+    let pat = read_utf16_cstr(lp_pattern);
+    let entries = rt.vfs.find_guest_files(&pat);
+    if entries.is_empty() {
+        rt.set_last_error(2);
+        return INVALID_HANDLE_VALUE;
+    }
+    fill_find_data_w(&entries[0], &mut *lp_find_data);
+    rt.insert_handle(KernelObject::FindSearch(Arc::new(Mutex::new(
+        FindSearchState { entries, cursor: 1 },
+    ))))
+}
+
+unsafe extern "win64" fn hle_find_next_file_a(
+    h_find: Handle,
+    lp_find_data: *mut Win32FindDataA,
+) -> i32 {
+    if lp_find_data.is_null() {
+        return 0;
+    }
+    let Some(rt) = current_runtime() else {
+        return 0;
+    };
+    let Some(search) = rt.get_find_search(h_find) else {
+        return 0;
+    };
+    let mut st = search.lock().unwrap();
+    if st.cursor >= st.entries.len() {
+        rt.set_last_error(18); // ERROR_NO_MORE_FILES
+        return 0;
+    }
+    fill_find_data_a(&st.entries[st.cursor], &mut *lp_find_data);
+    st.cursor += 1;
+    1
+}
+
+unsafe extern "win64" fn hle_find_next_file_w(
+    h_find: Handle,
+    lp_find_data: *mut Win32FindDataW,
+) -> i32 {
+    if lp_find_data.is_null() {
+        return 0;
+    }
+    let Some(rt) = current_runtime() else {
+        return 0;
+    };
+    let Some(search) = rt.get_find_search(h_find) else {
+        return 0;
+    };
+    let mut st = search.lock().unwrap();
+    if st.cursor >= st.entries.len() {
+        rt.set_last_error(18); // ERROR_NO_MORE_FILES
+        return 0;
+    }
+    fill_find_data_w(&st.entries[st.cursor], &mut *lp_find_data);
+    st.cursor += 1;
+    1
+}
+
+unsafe extern "win64" fn hle_find_close(h_find: Handle) -> i32 {
+    if let Some(rt) = current_runtime() {
+        i32::from(rt.close_handle(h_find))
+    } else {
+        0
+    }
 }
 
 unsafe fn read_utf16_cstr(ptr: *const u16) -> String {
@@ -766,28 +1078,108 @@ unsafe extern "win64" fn hle_tls_free(dw_tls_index: u32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamic Module Queries
+// Dynamic Module Queries (with pseudo-handle owned-DLL resolution for GDK thunks)
 // ---------------------------------------------------------------------------
 
-unsafe extern "win64" fn hle_get_module_handle_a(lp_module_name: *const c_char) -> Handle {
+const PSEUDO_HANDLE_BASE: usize = 0x7E00_0000;
+
+fn pseudo_modules() -> &'static Mutex<Vec<String>> {
+    static PSEUDOS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    PSEUDOS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn owned_pseudo_handle(raw_name: &str) -> Option<Handle> {
+    let reg = ModuleRegistry::new_default(false);
+    if !reg.owns_dll(raw_name) {
+        return None;
+    }
+    let norm = normalize_dll(raw_name);
+    let mut list = pseudo_modules().lock().unwrap();
+    if let Some(idx) = list.iter().position(|d| d == &norm) {
+        return Some((PSEUDO_HANDLE_BASE + idx * 16) as Handle);
+    }
+    let idx = list.len();
+    list.push(norm);
+    Some((PSEUDO_HANDLE_BASE + idx * 16) as Handle)
+}
+
+fn lookup_pseudo_dll(h_module: Handle) -> Option<String> {
+    let raw = h_module as usize;
+    if raw < PSEUDO_HANDLE_BASE || !(raw - PSEUDO_HANDLE_BASE).is_multiple_of(16) {
+        return None;
+    }
+    let idx = (raw - PSEUDO_HANDLE_BASE) / 16;
+    pseudo_modules().lock().unwrap().get(idx).cloned()
+}
+
+fn get_module_handle_impl(name_opt: Option<&str>) -> Handle {
+    if let Some(name) = name_opt {
+        if let Some(ph) = owned_pseudo_handle(name) {
+            if let Some(rt) = current_runtime() {
+                rt.trace(format!("kernelx!GetModuleHandle({name:?}) -> pseudo {ph:?}"));
+            }
+            return ph;
+        }
+    }
     let Some(rt) = current_runtime() else {
         return core::ptr::null_mut();
     };
     let Some(mods_arc) = rt.modules() else {
         return core::ptr::null_mut();
     };
+    let mods = mods_arc.lock().unwrap();
+    let handle = mods
+        .get_module(name_opt)
+        .map(|m| m.base_addr() as Handle)
+        .unwrap_or(core::ptr::null_mut());
+    rt.trace(format!("kernelx!GetModuleHandle({name_opt:?}) -> {handle:?}"));
+    handle
+}
+
+fn load_library_impl(name: &str) -> Handle {
+    if let Some(ph) = owned_pseudo_handle(name) {
+        if let Some(rt) = current_runtime() {
+            rt.trace(format!("kernelx!LoadLibrary({name:?}) -> pseudo {ph:?}"));
+        }
+        return ph;
+    }
+    let Some(rt) = current_runtime() else {
+        return core::ptr::null_mut();
+    };
+    let Some(mods_arc) = rt.modules() else {
+        return core::ptr::null_mut();
+    };
+    let reg = ModuleRegistry::new_default(false);
+    let mut mods = mods_arc.lock().unwrap();
+    match unsafe { mods.load_library(name, &reg) } {
+        Ok(img) => {
+            let h = img.base_addr() as Handle;
+            rt.trace(format!("kernelx!LoadLibrary({name:?}) -> {h:?}"));
+            h
+        }
+        Err(e) => {
+            rt.trace(format!("kernelx!LoadLibrary({name:?}) FAILED: {e}"));
+            core::ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "win64" fn hle_get_module_handle_a(lp_module_name: *const c_char) -> Handle {
     let name_opt = if lp_module_name.is_null() {
         None
     } else {
         Some(CStr::from_ptr(lp_module_name).to_string_lossy().into_owned())
     };
-    let mods = mods_arc.lock().unwrap();
-    let handle = mods
-        .get_module(name_opt.as_deref())
-        .map(|m| m.base_addr() as Handle)
-        .unwrap_or(core::ptr::null_mut());
-    rt.trace(format!("kernelx!GetModuleHandleA({name_opt:?}) -> {handle:?}"));
-    handle
+    get_module_handle_impl(name_opt.as_deref())
+}
+
+unsafe extern "win64" fn hle_get_module_handle_w(lp_module_name: *const u16) -> Handle {
+    let name_opt = if lp_module_name.is_null() {
+        None
+    } else {
+        Some(read_utf16_cstr(lp_module_name))
+    };
+    get_module_handle_impl(name_opt.as_deref())
 }
 
 unsafe extern "win64" fn hle_get_proc_address(
@@ -797,12 +1189,6 @@ unsafe extern "win64" fn hle_get_proc_address(
     if h_module.is_null() || lp_proc_name.is_null() {
         return core::ptr::null_mut();
     }
-    let Some(rt) = current_runtime() else {
-        return core::ptr::null_mut();
-    };
-    let Some(mods_arc) = rt.modules() else {
-        return core::ptr::null_mut();
-    };
     let raw = lp_proc_name as usize;
     let symbol = if raw <= 0xFFFF {
         ImportSymbol::Ordinal(raw as u16)
@@ -812,10 +1198,39 @@ unsafe extern "win64" fn hle_get_proc_address(
             name: CStr::from_ptr(lp_proc_name).to_string_lossy().into_owned(),
         }
     };
+
+    // 1. Check HLE-owned pseudo-handles first (e.g. xgameruntime.dll, d3d12_xs.dll, xmem.dll)
+    if let Some(dll_name) = lookup_pseudo_dll(h_module) {
+        let reg = ModuleRegistry::new_default(false);
+        let addr = match &symbol {
+            ImportSymbol::Name { name, .. } => reg.lookup_owned_export(&dll_name, name).unwrap_or(0),
+            ImportSymbol::Ordinal(_) => 0,
+        };
+        if let Some(rt) = current_runtime() {
+            if addr == 0 {
+                rt.set_last_error(127); // ERROR_PROC_NOT_FOUND
+            }
+            rt.trace(format!(
+                "kernelx!GetProcAddress(pseudo:{dll_name}, {symbol}) -> 0x{addr:X}"
+            ));
+        }
+        return addr as *mut c_void;
+    }
+
+    // 2. Otherwise search loaded guest PE modules
+    let Some(rt) = current_runtime() else {
+        return core::ptr::null_mut();
+    };
+    let Some(mods_arc) = rt.modules() else {
+        return core::ptr::null_mut();
+    };
     let mods = mods_arc.lock().unwrap();
     let addr = mods
         .resolve_proc_address(h_module as usize, &symbol)
         .unwrap_or(0);
+    if addr == 0 {
+        rt.set_last_error(127); // ERROR_PROC_NOT_FOUND
+    }
     rt.trace(format!(
         "kernelx!GetProcAddress({h_module:?}, {symbol}) -> 0x{addr:X}"
     ));
@@ -826,26 +1241,40 @@ unsafe extern "win64" fn hle_load_library_a(lp_lib_file_name: *const c_char) -> 
     if lp_lib_file_name.is_null() {
         return core::ptr::null_mut();
     }
-    let Some(rt) = current_runtime() else {
-        return core::ptr::null_mut();
-    };
-    let Some(mods_arc) = rt.modules() else {
-        return core::ptr::null_mut();
-    };
     let name = CStr::from_ptr(lp_lib_file_name).to_string_lossy().into_owned();
-    let reg = ModuleRegistry::new_default(false);
-    let mut mods = mods_arc.lock().unwrap();
-    match mods.load_library(&name, &reg) {
-        Ok(img) => {
-            let h = img.base_addr() as Handle;
-            rt.trace(format!("kernelx!LoadLibraryA({name:?}) -> {h:?}"));
-            h
-        }
-        Err(e) => {
-            rt.trace(format!("kernelx!LoadLibraryA({name:?}) FAILED: {e}"));
-            core::ptr::null_mut()
-        }
+    load_library_impl(&name)
+}
+
+unsafe extern "win64" fn hle_load_library_w(lp_lib_file_name: *const u16) -> Handle {
+    if lp_lib_file_name.is_null() {
+        return core::ptr::null_mut();
     }
+    let name = read_utf16_cstr(lp_lib_file_name);
+    load_library_impl(&name)
+}
+
+unsafe extern "win64" fn hle_load_library_ex_a(
+    lp_lib_file_name: *const c_char,
+    _h_file: Handle,
+    _dw_flags: u32,
+) -> Handle {
+    hle_load_library_a(lp_lib_file_name)
+}
+
+unsafe extern "win64" fn hle_load_library_ex_w(
+    lp_lib_file_name: *const u16,
+    _h_file: Handle,
+    _dw_flags: u32,
+) -> Handle {
+    hle_load_library_w(lp_lib_file_name)
+}
+
+unsafe extern "win64" fn hle_free_library(h_module: Handle) -> i32 {
+    if h_module.is_null() {
+        return 0;
+    }
+    // Owned pseudo-handles and loaded guest modules remain live until session teardown
+    1
 }
 
 // ---------------------------------------------------------------------------

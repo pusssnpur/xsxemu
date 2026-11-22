@@ -20,7 +20,14 @@ use crate::audio_mixer::AudioMixer;
 use crate::input::VirtualGamepadState;
 use crate::rtc::RtcConfig;
 use crate::services::{SaveContainerState, SaveUpdateState};
-use crate::vfs::VirtualFs;
+use crate::startup_trace::StartupTracer;
+use crate::vfs::{VfsDirEntry, VirtualFs};
+
+#[derive(Debug)]
+pub struct FindSearchState {
+    pub entries: Vec<VfsDirEntry>,
+    pub cursor: usize,
+}
 
 #[derive(Debug)]
 pub struct EventState {
@@ -50,6 +57,7 @@ pub struct CritState {
 pub enum KernelObject {
     Event(Arc<(Mutex<EventState>, Condvar)>),
     File(Arc<Mutex<File>>),
+    FindSearch(Arc<Mutex<FindSearchState>>),
     Thread(Arc<ThreadState>),
     TaskQueue {
         work_mode: u32,
@@ -90,6 +98,7 @@ pub struct GuestRuntime {
     d3d12: Mutex<Option<Arc<D3D12Translator>>>,
     heap_allocs: Mutex<HashMap<usize, Vec<u8>>>,
     modules: Mutex<Option<Arc<Mutex<LoadedModuleSet>>>>,
+    startup_tracer: Mutex<Option<Arc<StartupTracer>>>,
 
     // Phase 4 & 5 state: Virtual gamepads, multi-voice AudioMixer, DirectStorage telemetry
     gamepads: Mutex<[VirtualGamepadState; 4]>,
@@ -135,6 +144,7 @@ impl GuestRuntime {
             d3d12: Mutex::new(None),
             heap_allocs: Mutex::new(HashMap::new()),
             modules: Mutex::new(None),
+            startup_tracer: Mutex::new(None),
             gamepads: Mutex::new([
                 VirtualGamepadState::connected_default(),
                 VirtualGamepadState::default(),
@@ -144,6 +154,25 @@ impl GuestRuntime {
             audio_mixer: Mutex::new(AudioMixer::new(live_audio)),
             dstorage_bytes_read: AtomicU64::new(0),
         })
+    }
+
+    pub fn vfs(&self) -> &VirtualFs {
+        &self.vfs
+    }
+
+    pub fn set_startup_tracer(&self, tracer: Arc<StartupTracer>) {
+        *self.startup_tracer.lock().unwrap() = Some(tracer);
+    }
+
+    pub fn startup_tracer(&self) -> Option<Arc<StartupTracer>> {
+        self.startup_tracer.lock().unwrap().clone()
+    }
+
+    pub fn get_find_search(&self, h: Handle) -> Option<Arc<Mutex<FindSearchState>>> {
+        match self.handles.lock().unwrap().get(&(h as usize)) {
+            Some(KernelObject::FindSearch(fs)) => Some(Arc::clone(fs)),
+            _ => None,
+        }
     }
 
     pub fn rtc(&self) -> RtcConfig {
@@ -288,6 +317,9 @@ impl GuestRuntime {
     pub fn log_debug_string(&self, s: String) {
         if self.trace_hle {
             eprintln!("[guest-debug] {s}");
+        }
+        if let Some(st) = self.startup_tracer() {
+            st.record_debug_string(&s);
         }
         self.debug_messages.lock().unwrap().push(s);
     }
