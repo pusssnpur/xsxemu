@@ -41,9 +41,15 @@ cargo run -p xsxemu -- inspect ./phase2_out/xsx_helper.dll
 cargo run -p xsxemu -- inspect ./phase2_out/phase2_xsx.exe
 cargo run -p xsxemu -- run ./phase2_out/phase2_xsx.exe --trace --force-relocate --dump-frame fsr_frame.bmp
 
-# Phase 3 + Phase 4 full-stack suite (DXBC shader stripping, PSO/Dispatch, DirectStorage, XInput, XAudio2, XUser, XGameSave, FSR)
-cargo run -p xsxemu -- gen-fullstack ./fullstack_out
-cargo run -p xsxemu -- run ./fullstack_out/full_stack_xsx.exe --trace --force-relocate --dump-frame fullstack_fsr.bmp
+# Phase 3 + Phase 4 + Phase 5 full-stack suite (RTC, DXBC MD5 + ShaderCache, PSO/Dispatch, DirectStorage, XInput, XAudio2 WAV, XUser, XGameSave, multithreaded FSR)
+cargo run --release -p xsxemu -- gen-fullstack ./fullstack_out
+cargo run --release -p xsxemu -- run ./fullstack_out/full_stack_xsx.exe \
+  --trace --force-relocate --rtc-offset 0 \
+  --shader-cache ./shader_cache \
+  --dump-frame fullstack_fsr.bmp --dump-audio fullstack_audio.wav
+
+# Benchmark multithreaded AMD FSR (EASU + RCAS)
+cargo run --release -p xsxemu -- bench-fsr --width 1280 --height 720 --fsr quality
 ```
 
 ### AMD FSR Upscaling (Enabled by Default)

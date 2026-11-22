@@ -16,7 +16,9 @@ use xsx_d3d12::translate::HostDeviceCreateConfig;
 use xsx_d3d12::{D3D12Translator, FsrFrameStats, PresentedFrame, TranslatorConfig};
 use xsx_loader::LoadedModuleSet;
 
+use crate::audio_mixer::AudioMixer;
 use crate::input::VirtualGamepadState;
+use crate::rtc::RtcConfig;
 use crate::services::{SaveContainerState, SaveUpdateState};
 use crate::vfs::VirtualFs;
 
@@ -74,6 +76,7 @@ pub struct GuestRuntime {
     pub translator_config: TranslatorConfig,
     pub vfs: VirtualFs,
     pub trace_hle: bool,
+    rtc: Mutex<RtcConfig>,
     start_time: Instant,
     last_error: AtomicU32,
     game_runtime_initialized: AtomicBool,
@@ -88,10 +91,9 @@ pub struct GuestRuntime {
     heap_allocs: Mutex<HashMap<usize, Vec<u8>>>,
     modules: Mutex<Option<Arc<Mutex<LoadedModuleSet>>>>,
 
-    // Phase 4 state: Virtual gamepads, XAudio2 PCM capture, DirectStorage telemetry
+    // Phase 4 & 5 state: Virtual gamepads, multi-voice AudioMixer, DirectStorage telemetry
     gamepads: Mutex<[VirtualGamepadState; 4]>,
-    audio_pcm_bytes: Mutex<Vec<u8>>,
-    audio_samples_submitted: AtomicU64,
+    audio_mixer: Mutex<AudioMixer>,
     dstorage_bytes_read: AtomicU64,
 }
 
@@ -105,10 +107,21 @@ impl GuestRuntime {
         vfs: VirtualFs,
         trace_hle: bool,
     ) -> Arc<Self> {
+        Self::with_options(translator_config, vfs, RtcConfig::default(), false, trace_hle)
+    }
+
+    pub fn with_options(
+        translator_config: TranslatorConfig,
+        vfs: VirtualFs,
+        rtc: RtcConfig,
+        live_audio: bool,
+        trace_hle: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             translator_config,
             vfs,
             trace_hle,
+            rtc: Mutex::new(rtc),
             start_time: Instant::now(),
             last_error: AtomicU32::new(0),
             game_runtime_initialized: AtomicBool::new(false),
@@ -128,10 +141,17 @@ impl GuestRuntime {
                 VirtualGamepadState::default(),
                 VirtualGamepadState::default(),
             ]),
-            audio_pcm_bytes: Mutex::new(Vec::new()),
-            audio_samples_submitted: AtomicU64::new(0),
+            audio_mixer: Mutex::new(AudioMixer::new(live_audio)),
             dstorage_bytes_read: AtomicU64::new(0),
         })
+    }
+
+    pub fn rtc(&self) -> RtcConfig {
+        *self.rtc.lock().unwrap()
+    }
+
+    pub fn set_rtc(&self, cfg: RtcConfig) {
+        *self.rtc.lock().unwrap() = cfg;
     }
 
     pub fn attach_modules(&self, modules: Arc<Mutex<LoadedModuleSet>>) {
@@ -143,7 +163,7 @@ impl GuestRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 4 Gamepad, Audio, DirectStorage, and Save helpers
+    // Phase 4 & 5 Gamepad, AudioMixer, DirectStorage, and Save helpers
     // -----------------------------------------------------------------------
 
     pub fn set_virtual_gamepad(&self, user_index: u32, gamepad: XInputGamepad) {
@@ -169,22 +189,33 @@ impl GuestRuntime {
         }
     }
 
-    pub fn record_audio_pcm(&self, pcm: &[u8], samples: u64) {
-        self.audio_samples_submitted
-            .fetch_add(samples, Ordering::Relaxed);
-        let mut buf = self.audio_pcm_bytes.lock().unwrap();
-        // Cap captured buffer to 4 MiB for telemetry safety
-        if buf.len() + pcm.len() <= 4 * 1024 * 1024 {
-            buf.extend_from_slice(pcm);
-        }
+    pub fn set_master_volume(&self, volume: f32) {
+        self.audio_mixer.lock().unwrap().set_master_volume(volume);
+    }
+
+    pub fn mix_audio_pcm(
+        &self,
+        pcm: &[u8],
+        src_channels: u16,
+        src_sample_rate: u32,
+        voice_volume: f32,
+    ) -> u64 {
+        self.audio_mixer
+            .lock()
+            .unwrap()
+            .submit_pcm16(pcm, src_channels, src_sample_rate, voice_volume)
     }
 
     pub fn audio_samples_submitted(&self) -> u64 {
-        self.audio_samples_submitted.load(Ordering::Relaxed)
+        self.audio_mixer.lock().unwrap().total_frames_mixed()
     }
 
     pub fn audio_pcm_len(&self) -> usize {
-        self.audio_pcm_bytes.lock().unwrap().len()
+        self.audio_mixer.lock().unwrap().pcm_byte_len()
+    }
+
+    pub fn write_audio_wav(&self, path: &std::path::Path) -> std::io::Result<()> {
+        self.audio_mixer.lock().unwrap().write_wav(path)
     }
 
     pub fn record_dstorage_bytes(&self, bytes: u64) {

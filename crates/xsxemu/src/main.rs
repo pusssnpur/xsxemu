@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use xsx_d3d12::{BackendKind, FsrConfig, FsrQualityMode, TranslatorConfig};
-use xsx_hle::{GuestRuntime, ModuleRegistry, RuntimeGuard, VirtualFs};
+use xsx_d3d12::fsr::process_frame;
+use xsx_d3d12::{BackendKind, FsrConfig, FsrQualityMode, PresentedFrame, TranslatorConfig};
+use xsx_hle::{GuestRuntime, ModuleRegistry, RtcConfig, RuntimeGuard, VirtualFs};
 use xsx_loader::{default_search_dirs, LoadedModuleSet, PeImage};
 use xsx_testgen::{
     build_full_stack_xsx_pe, build_hello_xsx_pe, build_helper_dll_pe, build_phase2_xsx_pe,
@@ -24,6 +25,7 @@ fn print_usage() {
            xsxemu gen-fullstack <output_dir>\n\
            xsxemu inspect <binary.exe|dll>\n\
            xsxemu run <binary.exe> [OPTIONS]\n\
+           xsxemu bench-fsr [--width W] [--height H] [--fsr MODE]\n\
          \n\
          RUN OPTIONS:\n\
            --backend <auto|d3d12|software>       Select GPU backend (default: auto)\n\
@@ -32,11 +34,15 @@ fn print_usage() {
                   ultra-quality|ultra-performance|native-aa|off>\n\
            --fsr-sharpness <0.0..=1.0>           RCAS sharpening strength (default: 0.8)\n\
            --output-res <WxH>                    Explicit FSR output resolution (e.g. 1920x1080)\n\
+           --shader-cache <dir>                  Persistent on-disk DXBC/DXIL shader cache\n\
+           --rtc-offset <seconds>                Signed Real-Time Clock offset in seconds\n\
+           --live-audio                          Enable live Windows winmm.dll sound output\n\
+           --dump-audio <path.wav>               Export mixed 48 kHz stereo XAudio2 output to WAV\n\
            --dll-dir <path>                      Extra search directory for secondary guest DLLs\n\
            --game-dir <path>                     Host directory mapped to Xbox G:\\ (and D:\\)\n\
-           --scratch-dir <path>                  Host directory mapped to Xbox T:\\\n\
+           --scratch-dir <path>                  Host directory mapped to Xbox T:\\ (saves in T:\\saves)\n\
            --dump-frame <path.bmp|path.ppm>      Write presented (FSR-upscaled) frame to disk\n\
-           --trace                               Enable HLE, D3D12.x, and FSR call tracing\n\
+           --trace                               Enable HLE, D3D12.x, RTC, and FSR call tracing\n\
            --allow-stubs                         Stub unresolved imports instead of failing\n\
            --force-relocate                      Force base relocation away from ImageBase",
         env!("CARGO_PKG_VERSION")
@@ -56,6 +62,7 @@ fn main() -> ExitCode {
         "gen-fullstack" => cmd_gen_fullstack(&args[1..]),
         "inspect" => cmd_inspect(&args[1..]),
         "run" => cmd_run(&args[1..]),
+        "bench-fsr" => cmd_bench_fsr(&args[1..]),
         "-h" | "--help" | "help" => {
             print_usage();
             ExitCode::SUCCESS
@@ -149,6 +156,75 @@ fn cmd_gen_fullstack(args: &[String]) -> ExitCode {
         exe_bytes.len(),
         asset_path.display(),
         FULLSTACK_ASSET_PAYLOAD.len()
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_bench_fsr(args: &[String]) -> ExitCode {
+    let mut width: u32 = 1280;
+    let mut height: u32 = 720;
+    let mut fsr = FsrConfig::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--width" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
+                    width = v;
+                }
+            }
+            "--height" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
+                    height = v;
+                }
+            }
+            "--fsr" => {
+                i += 1;
+                if let Some(m) = args.get(i).and_then(|s| FsrQualityMode::parse(s)) {
+                    fsr.mode = m;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let idx = ((y * width + x) * 4) as usize;
+            rgba[idx] = ((x * 255) / width.max(1)) as u8;
+            rgba[idx + 1] = ((y * 255) / height.max(1)) as u8;
+            rgba[idx + 2] = if (x ^ y) & 32 != 0 { 220 } else { 40 };
+            rgba[idx + 3] = 255;
+        }
+    }
+    let frame = PresentedFrame {
+        frame_index: 0,
+        width,
+        height,
+        rgba,
+    };
+
+    let (out, stats) = process_frame(&frame, &fsr);
+    let ms = stats.duration_us as f64 / 1000.0;
+    let fps = if ms > 0.0 { 1000.0 / ms } else { 0.0 };
+    println!(
+        "FSR Benchmark ({}): {}x{} -> {}x{} | EASU={} RCAS={} | {:.2} ms ({:.1} FPS, {} threads)",
+        stats.mode.name(),
+        width,
+        height,
+        out.width,
+        out.height,
+        stats.easu_ran,
+        stats.rcas_ran,
+        ms,
+        fps,
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     );
     ExitCode::SUCCESS
 }
@@ -275,7 +351,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     let mut backend = BackendKind::Auto;
     let mut windowed = false;
-    let mut fsr = FsrConfig::default(); // Enabled by default (Quality 1.5x EASU + RCAS)
+    let mut fsr = FsrConfig::default();
+    let mut shader_cache_dir: Option<PathBuf> = None;
+    let mut rtc = RtcConfig::default();
+    let mut live_audio = false;
+    let mut dump_audio: Option<PathBuf> = None;
     let mut dump_frame: Option<PathBuf> = None;
     let mut extra_dll_dirs: Vec<PathBuf> = Vec::new();
     let mut game_dir: Option<PathBuf> = None;
@@ -341,6 +421,37 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 fsr.output_resolution = Some((w, h));
+            }
+            "--shader-cache" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    eprintln!("--shader-cache requires a directory path");
+                    return ExitCode::from(2);
+                };
+                shader_cache_dir = Some(PathBuf::from(val));
+            }
+            "--rtc-offset" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    eprintln!("--rtc-offset requires a signed integer number of seconds");
+                    return ExitCode::from(2);
+                };
+                match val.parse::<i64>() {
+                    Ok(sec) => rtc.offset_seconds = sec,
+                    Err(_) => {
+                        eprintln!("invalid --rtc-offset value '{val}'");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--live-audio" => live_audio = true,
+            "--dump-audio" => {
+                i += 1;
+                let Some(val) = args.get(i) else {
+                    eprintln!("--dump-audio requires an output .wav path");
+                    return ExitCode::from(2);
+                };
+                dump_audio = Some(PathBuf::from(val));
             }
             "--dll-dir" => {
                 i += 1;
@@ -419,9 +530,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         trace_calls: trace,
         fsr,
         windowed,
+        shader_cache_dir,
         ..TranslatorConfig::default()
     };
-    let runtime = GuestRuntime::with_vfs(cfg, vfs, trace);
+    let runtime = GuestRuntime::with_options(cfg, vfs, rtc, live_audio, trace);
     let _guard = RuntimeGuard::activate(runtime.clone());
 
     let registry = ModuleRegistry::new_default(allow_stubs);
@@ -465,6 +577,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     let exit_code = unsafe { main_img.execute_entry() };
     println!("Guest exited with code {exit_code}");
+    println!("RTC (UTC): {}", runtime.rtc().format_utc_iso8601());
 
     for msg in runtime.debug_messages() {
         println!("[Guest OutputDebugStringA] {msg}");
@@ -475,7 +588,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     println!("Presented frames: {}", frames.len());
     if let Some(st) = fsr_stats.last() {
         println!(
-            "FSR ({}): {}x{} -> {}x{} (EASU={}, RCAS={}, sharpness={:.2}, {}us)",
+            "FSR ({}): {}x{} -> {}x{} (EASU={}, RCAS={}, sharpness={:.2}, {:.2}ms)",
             st.mode.name(),
             st.input_width,
             st.input_height,
@@ -484,8 +597,34 @@ fn cmd_run(args: &[String]) -> ExitCode {
             st.easu_ran,
             st.rcas_ran,
             st.sharpness,
-            st.duration_us
+            st.duration_us as f64 / 1000.0
         );
+    }
+    if let Some(tr) = runtime.d3d12_translator() {
+        let (hits, misses) = tr.shader_cache_stats();
+        if hits > 0 || misses > 0 {
+            println!("Shader cache: {hits} hit(s), {misses} miss(es)");
+        }
+    }
+    if runtime.audio_samples_submitted() > 0 {
+        println!(
+            "Audio mixed: {} stereo 48kHz frames ({} bytes)",
+            runtime.audio_samples_submitted(),
+            runtime.audio_pcm_len()
+        );
+    }
+    if runtime.dstorage_bytes_read() > 0 {
+        println!("DirectStorage streamed: {} bytes", runtime.dstorage_bytes_read());
+    }
+
+    if let Some(wav_path) = dump_audio {
+        match runtime.write_audio_wav(&wav_path) {
+            Ok(()) => println!("Dumped mixed audio WAV to {}", wav_path.display()),
+            Err(e) => {
+                eprintln!("failed to dump audio WAV: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     if let (Some(out_path), Some(frame)) = (dump_frame, frames.last()) {

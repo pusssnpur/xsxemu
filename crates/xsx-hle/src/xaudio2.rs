@@ -231,7 +231,10 @@ unsafe extern "win64" fn mv_release(this: *mut c_void) -> u32 {
     }
 }
 
-unsafe extern "win64" fn mv_set_volume(_this: *mut c_void, _volume: f32) -> HResult {
+unsafe extern "win64" fn mv_set_volume(_this: *mut c_void, volume: f32) -> HResult {
+    if let Some(rt) = current_runtime() {
+        rt.set_master_volume(volume);
+    }
     S_OK
 }
 
@@ -332,13 +335,13 @@ unsafe extern "win64" fn sv_submit_buffer(
     let buf = &*p_buffer;
     if !buf.p_audio_data.is_null() && buf.audio_bytes > 0 {
         let pcm = std::slice::from_raw_parts(buf.p_audio_data, buf.audio_bytes as usize);
-        let bytes_per_frame = (sv.format.n_block_align as u64).max(2);
-        let samples = (buf.audio_bytes as u64) / bytes_per_frame;
+        let ch = sv.format.n_channels;
+        let rate = sv.format.n_samples_per_sec;
+        let mixed_frames = sv.runtime.mix_audio_pcm(pcm, ch, rate, 1.0);
         sv.buffers_queued.fetch_add(1, Ordering::Relaxed);
-        sv.samples_played.fetch_add(samples, Ordering::Relaxed);
-        sv.runtime.record_audio_pcm(pcm, samples);
+        sv.samples_played.fetch_add(mixed_frames, Ordering::Relaxed);
         sv.runtime.trace(format!(
-            "IXAudio2SourceVoice::SubmitSourceBuffer(bytes={}, samples={samples})",
+            "IXAudio2SourceVoice::SubmitSourceBuffer(bytes={}, ch={ch}, rate={rate}Hz -> mixed_48k_frames={mixed_frames})",
             buf.audio_bytes
         ));
     }

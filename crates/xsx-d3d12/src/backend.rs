@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +15,8 @@ use xsx_abi::d3d12::{
 
 use crate::fsr::{self, FsrComputePlan, FsrConfig, FsrFrameStats, FsrTemporalInputs};
 use crate::native_win;
-use crate::shader::{translate_xbox_shader_container, TranslatedShader, DXBC_MAGIC};
+use crate::shader::{TranslatedShader, DXBC_MAGIC};
+use crate::shader_cache::ShaderCache;
 use crate::software::SoftwareD3D12Backend;
 use crate::staging::UmaStagingRing;
 use crate::translate::{translate_heap_properties, HostDeviceCreateConfig};
@@ -40,6 +41,8 @@ pub struct TranslatorConfig {
     pub fsr: FsrConfig,
     /// Show a visible Win32 presentation window on Windows x86_64 (false = hidden/headless).
     pub windowed: bool,
+    /// Optional on-disk shader cache directory for translated Xbox -> PC DXBC/DXIL containers.
+    pub shader_cache_dir: Option<PathBuf>,
 }
 
 impl Default for TranslatorConfig {
@@ -51,6 +54,7 @@ impl Default for TranslatorConfig {
             default_height: 360,
             fsr: FsrConfig::default(),
             windowed: false,
+            shader_cache_dir: None,
         }
     }
 }
@@ -225,6 +229,7 @@ pub struct D3D12Translator {
     dispatch_count: AtomicU64,
     fences: Mutex<HashMap<u64, u64>>,
     staging_ring: Mutex<UmaStagingRing>,
+    shader_cache: Mutex<ShaderCache>,
     translated_shaders: Mutex<Vec<TranslatedShader>>,
     presented_frames: Mutex<Vec<PresentedFrame>>,
     fsr_stats: Mutex<Vec<FsrFrameStats>>,
@@ -276,6 +281,7 @@ impl D3D12Translator {
         };
 
         let backend_name = backend.name();
+        let shader_cache = ShaderCache::new(config.shader_cache_dir.clone());
         Ok(Arc::new(Self {
             config,
             backend: Mutex::new(backend),
@@ -285,6 +291,7 @@ impl D3D12Translator {
             dispatch_count: AtomicU64::new(0),
             fences: Mutex::new(HashMap::new()),
             staging_ring: Mutex::new(UmaStagingRing::new(4 * 1024 * 1024)),
+            shader_cache: Mutex::new(shader_cache),
             translated_shaders: Mutex::new(Vec::new()),
             presented_frames: Mutex::new(Vec::new()),
             fsr_stats: Mutex::new(Vec::new()),
@@ -310,6 +317,12 @@ impl D3D12Translator {
             .lock()
             .map(|s| s.clone())
             .unwrap_or_default()
+    }
+
+    /// Return `(cache_hits, cache_misses)` for the shader translation cache.
+    pub fn shader_cache_stats(&self) -> (u64, u64) {
+        let c = self.shader_cache.lock().unwrap();
+        (c.hits(), c.misses())
     }
 
     pub fn dispatch_count(&self) -> u64 {
@@ -366,10 +379,12 @@ impl D3D12Translator {
 
     fn inspect_and_translate_shader(&self, stage: &str, bytecode: &[u8]) {
         if bytecode.len() >= 4 && bytecode[0..4] == DXBC_MAGIC {
-            match translate_xbox_shader_container(bytecode) {
+            let res = self.shader_cache.lock().unwrap().get_or_translate(bytecode);
+            match res {
                 Ok(tr) => {
+                    let (hits, misses) = self.shader_cache_stats();
                     self.record_trace(format!(
-                        "ShaderTranslate({stage}): dxil={}, stripped={:?}, retained={:?}",
+                        "ShaderTranslate({stage}): dxil={}, stripped={:?}, retained={:?} (cache hits={hits}, misses={misses})",
                         tr.has_dxil, tr.stripped_chunks, tr.retained_chunks
                     ));
                     self.translated_shaders.lock().unwrap().push(tr);

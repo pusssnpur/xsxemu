@@ -89,9 +89,9 @@ By targeting **Windows x86_64 with native Direct3D 12**, `xsxemu` achieves near-
 - [x] `dstorage_x.dll` / `dstorage.dll` -> `IDStorageFactoryX`, `IDStorageFileX`, `IDStorageQueueX` streaming from `VirtualFs`
 - [x] `XUser`, `XStore`, and persistent `XGameSave` local profile, license, and on-disk save container/blob storage (`S:\`)
 
-### Phase 5 — Improvements & Real-Title Compatibility (Next)
-- [ ] Full hardware GPU command replay (`ID3D12GraphicsCommandList` PSO/RootSignature/VB/RTV/DrawInstanced + GPU compute FSR EASU/RCAS dispatch onto `IDXGISwapChain3` backbuffers)
-- [ ] FSR 2/3 temporal reprojection & motion-vector integration
-- [ ] WASAPI real-time audio playback backend for `XAudio2_9` mixed PCM stream
-- [ ] Expanded CRT / Win32 / WinRT HLE coverage for real Dev Mode & GDK homebrew binaries
-- [ ] Performance profiling, SIMD-accelerated software FSR, and shader cache persistence
+### Phase 5 — Improvements (RTC, True Hardware GPU Replay, Performance & Sound)
+- [x] **Real-Time Clock (RTC) & System Info** (`xsx-hle::rtc`, `GetSystemTime`, `GetLocalTime`, `GetSystemTimeAsFileTime`, `GetSystemTimePreciseAsFileTime`, `SystemTimeToFileTime`, `FileTimeToSystemTime`, `GetTimeZoneInformation`, `GetSystemInfo` 8-core Zen 2 topology, `--rtc-offset`)
+- [x] **True Windows Direct3D 12 Hardware Execution** (`IDXGISwapChain3::GetBuffer`, host RTVs, `D3D12SerializeRootSignature`, host FSR Compute PSOs, real `Reset`/`ResourceBarrier`/`OMSetRenderTargets`/`ClearRenderTargetView`/`Close`/`ExecuteCommandLists`/`Present`/`Signal`/`SetEventOnCompletion` GPU synchronization, Win32 message pumping)
+- [x] **Performance Improvements**: Multithreaded row-band FSR (`std::thread::scope`) with border-padded linear RGB+luma prepass (`bench-fsr`), authentic Microsoft DXBC MD5-variant digest recomputation, and persistent on-disk `ShaderCache` (`--shader-cache`)
+- [x] **Sound Improvements**: 48 kHz stereo multi-voice `AudioMixer` with linear resampling, soft-clipping saturation, RIFF/WAVE `.wav` export (`--dump-audio`), and live Windows `winmm.dll` `waveOut` playback (`--live-audio`)
+- [ ] Future: Full hardware GPU vertex/shader replay + GPU-side FSR 2/3 temporal reprojection pass onto `IDXGISwapChain3` backbuffers & expanded WinRT/CRT compatibility for retail Dev Mode titles

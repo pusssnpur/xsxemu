@@ -18,25 +18,37 @@ use std::thread;
 use std::time::Duration;
 
 use xsx_abi::gdk::{
-    CriticalSection, Handle, SrwLock, ThreadStartRoutine, TitleMemoryStatus, CREATE_ALWAYS,
-    CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_CURRENT,
-    FILE_END, GENERIC_READ, GENERIC_WRITE, INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE,
-    OPEN_ALWAYS, OPEN_EXISTING, TRUNCATE_EXISTING, WAIT_FAILED,
+    CriticalSection, FileTime, Handle, SrwLock, SystemInfo, SystemTime, ThreadStartRoutine,
+    TimeZoneInformation, TitleMemoryStatus, CREATE_ALWAYS, CREATE_NEW, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_BEGIN, FILE_CURRENT, FILE_END, GENERIC_READ, GENERIC_WRITE,
+    INVALID_FILE_ATTRIBUTES, INVALID_HANDLE_VALUE, OPEN_ALWAYS, OPEN_EXISTING,
+    PROCESSOR_ARCHITECTURE_AMD64, TRUNCATE_EXISTING, WAIT_FAILED,
 };
 use xsx_loader::ImportSymbol;
 
 use crate::registry::ModuleRegistry;
+use crate::rtc::{filetime_to_systemtime, systemtime_to_filetime};
 use crate::runtime::{current_runtime, EventState, GuestRuntime, KernelObject, ThreadState};
 
 const PROCESS_HEAP_HANDLE: Handle = 0xDEAD_BEE0usize as Handle;
 
 pub fn register(reg: &mut ModuleRegistry) {
-    // Diagnostics & timing
+    // Diagnostics, timing & Real-Time Clock (RTC)
     reg.register_export("kernelx.dll", "OutputDebugStringA", hle_output_debug_string_a as *const () as usize);
     reg.register_export("kernelx.dll", "QueryPerformanceCounter", hle_query_performance_counter as *const () as usize);
     reg.register_export("kernelx.dll", "QueryPerformanceFrequency", hle_query_performance_frequency as *const () as usize);
     reg.register_export("kernelx.dll", "GetTickCount64", hle_get_tick_count_64 as *const () as usize);
     reg.register_export("kernelx.dll", "Sleep", hle_sleep as *const () as usize);
+    reg.register_export("kernelx.dll", "GetSystemTime", hle_get_system_time as *const () as usize);
+    reg.register_export("kernelx.dll", "GetLocalTime", hle_get_local_time as *const () as usize);
+    reg.register_export("kernelx.dll", "GetSystemTimeAsFileTime", hle_get_system_time_as_file_time as *const () as usize);
+    reg.register_export("kernelx.dll", "GetSystemTimePreciseAsFileTime", hle_get_system_time_as_file_time as *const () as usize);
+    reg.register_export("kernelx.dll", "SystemTimeToFileTime", hle_system_time_to_file_time as *const () as usize);
+    reg.register_export("kernelx.dll", "FileTimeToSystemTime", hle_file_time_to_system_time as *const () as usize);
+    reg.register_export("kernelx.dll", "GetTimeZoneInformation", hle_get_time_zone_information as *const () as usize);
+    reg.register_export("kernelx.dll", "GetSystemInfo", hle_get_system_info as *const () as usize);
+    reg.register_export("kernelx.dll", "IsProcessorFeaturePresent", hle_is_processor_feature_present as *const () as usize);
+    reg.register_export("kernelx.dll", "FlushInstructionCache", hle_flush_instruction_cache as *const () as usize);
     reg.register_export("kernelx.dll", "GetLastError", hle_get_last_error as *const () as usize);
     reg.register_export("kernelx.dll", "SetLastError", hle_set_last_error as *const () as usize);
     reg.register_export("kernelx.dll", "GetCurrentProcessId", hle_get_current_process_id as *const () as usize);
@@ -834,4 +846,118 @@ unsafe extern "win64" fn hle_load_library_a(lp_lib_file_name: *const c_char) -> 
             core::ptr::null_mut()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real-Time Clock (RTC) & System Info
+// ---------------------------------------------------------------------------
+
+unsafe extern "win64" fn hle_get_system_time(lp_system_time: *mut SystemTime) {
+    if lp_system_time.is_null() {
+        return;
+    }
+    let st = current_runtime()
+        .map(|rt| {
+            let st = rt.rtc().now_systemtime_utc();
+            rt.trace(format!(
+                "kernelx!GetSystemTime() -> {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                st.w_year, st.w_month, st.w_day, st.w_hour, st.w_minute, st.w_second
+            ));
+            st
+        })
+        .unwrap_or_default();
+    *lp_system_time = st;
+}
+
+unsafe extern "win64" fn hle_get_local_time(lp_system_time: *mut SystemTime) {
+    if lp_system_time.is_null() {
+        return;
+    }
+    let st = current_runtime()
+        .map(|rt| rt.rtc().now_systemtime_local())
+        .unwrap_or_default();
+    *lp_system_time = st;
+}
+
+unsafe extern "win64" fn hle_get_system_time_as_file_time(lp_file_time: *mut FileTime) {
+    if lp_file_time.is_null() {
+        return;
+    }
+    let ft = current_runtime()
+        .map(|rt| rt.rtc().now_filetime_utc())
+        .unwrap_or_default();
+    *lp_file_time = ft;
+}
+
+unsafe extern "win64" fn hle_system_time_to_file_time(
+    lp_system_time: *const SystemTime,
+    lp_file_time: *mut FileTime,
+) -> i32 {
+    if lp_system_time.is_null() || lp_file_time.is_null() {
+        return 0;
+    }
+    match systemtime_to_filetime(*lp_system_time) {
+        Some(ft) => {
+            *lp_file_time = ft;
+            1
+        }
+        None => 0,
+    }
+}
+
+unsafe extern "win64" fn hle_file_time_to_system_time(
+    lp_file_time: *const FileTime,
+    lp_system_time: *mut SystemTime,
+) -> i32 {
+    if lp_file_time.is_null() || lp_system_time.is_null() {
+        return 0;
+    }
+    *lp_system_time = filetime_to_systemtime(*lp_file_time);
+    1
+}
+
+unsafe extern "win64" fn hle_get_time_zone_information(lp_tzi: *mut TimeZoneInformation) -> u32 {
+    if lp_tzi.is_null() {
+        return 0xFFFF_FFFF;
+    }
+    *lp_tzi = current_runtime()
+        .map(|rt| rt.rtc().timezone_info())
+        .unwrap_or_default();
+    1 // TIME_ZONE_ID_STANDARD
+}
+
+unsafe extern "win64" fn hle_get_system_info(lp_system_info: *mut SystemInfo) {
+    if lp_system_info.is_null() {
+        return;
+    }
+    // Report Xbox Series X AMD Zen 2 8-core / 16-thread topology
+    *lp_system_info = SystemInfo {
+        w_processor_architecture: PROCESSOR_ARCHITECTURE_AMD64,
+        w_reserved: 0,
+        dw_page_size: 4096,
+        lp_minimum_application_address: 0x0001_0000,
+        lp_maximum_application_address: 0x0000_7FFF_FFFE_FFFF,
+        dw_active_processor_mask: 0x00FF,
+        dw_number_of_processors: 8,
+        dw_processor_type: 8664,
+        dw_allocation_granularity: 65536,
+        w_processor_level: 23, // AMD Zen 2 Family 17h
+        w_processor_revision: 0x4700,
+    };
+}
+
+unsafe extern "win64" fn hle_is_processor_feature_present(feature: u32) -> i32 {
+    // Report standard x86_64 / Zen 2 features (SSE2, SSE3, SSE4.1, SSE4.2, AVX, AVX2, XMMI64, RDTSC)
+    match feature {
+        6 | 10 | 12 | 13 | 14 | 17 | 36 | 37 | 38 | 39 | 40 => 1,
+        _ => 0,
+    }
+}
+
+unsafe extern "win64" fn hle_flush_instruction_cache(
+    _h_process: Handle,
+    _lp_base_address: *const c_void,
+    _dw_size: usize,
+) -> i32 {
+    1
 }

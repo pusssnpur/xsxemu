@@ -79,7 +79,10 @@ pub fn build_full_stack_xsx_pe() -> Vec<u8> {
                 "XGameSaveCloseProvider",
             ],
         ),
-        ("kernelx.dll", &["OutputDebugStringA"]),
+        (
+            "kernelx.dll",
+            &["OutputDebugStringA", "GetSystemTime", "GetSystemInfo"],
+        ),
         ("dstorage_x.dll", &["DStorageGetFactory"]),
         ("xinput1_4.dll", &["XInputGetState", "XInputSetState"]),
         ("xaudio2_9.dll", &["XAudio2Create"]),
@@ -88,7 +91,7 @@ pub fn build_full_stack_xsx_pe() -> Vec<u8> {
     let (idata_bytes, iat_rvas, idata_dir_size) = build_idata(IDATA_RVA, import_spec);
 
     // -----------------------------------------------------------------------
-    // .rdata (constants, synthetic Xbox DXBC shader, PCM audio, triangle vertices)
+    // .rdata (constants, synthetic Xbox DXBC shader, 440Hz PCM sine wave, triangle vertices)
     // -----------------------------------------------------------------------
     let mut rdata = DataBuilder::new(RDATA_RVA);
     let rva_container_name = rdata.push_cstr("slot0");
@@ -108,8 +111,15 @@ pub fn build_full_stack_xsx_pe() -> Vec<u8> {
     let rva_xbox_shader = rdata.push_bytes(&xbox_shader_bytes);
     let xbox_shader_len = xbox_shader_bytes.len();
 
-    // 256 stereo 16-bit PCM frames (1024 bytes) for XAudio2 submission
-    let pcm_samples = vec![0x20u8; 1024];
+    // 256 stereo 16-bit 440 Hz A4 sine wave PCM frames (1024 bytes) for XAudio2 submission
+    let mut pcm_samples = Vec::with_capacity(1024);
+    for i in 0..256usize {
+        let t = (i as f32) / 48_000.0;
+        let s = ((2.0 * core::f32::consts::PI * 440.0 * t).sin() * 0.6 * 32767.0) as i16;
+        let b = s.to_le_bytes();
+        pcm_samples.extend_from_slice(&b);
+        pcm_samples.extend_from_slice(&b);
+    }
     let rva_pcm_data = rdata.push_bytes(&pcm_samples);
 
     let rva_wave_fmt = rdata.push_struct(&WaveFormatEx {
@@ -253,6 +263,8 @@ pub fn build_full_stack_xsx_pe() -> Vec<u8> {
     let rva_stream_buf = data.push_zeroed(64);
     let rva_xinput_state = data.push_struct(&XInputState::default());
     let rva_license = data.push_struct(&XStoreGameLicense::default());
+    let rva_sys_time = data.push_zeroed(16);
+    let rva_sys_info = data.push_zeroed(48);
 
     // DirectStorage request with relocated destination_buffer -> rva_stream_buf
     // (source_file at offset 0 is filled dynamically at runtime!)
@@ -338,6 +350,15 @@ pub fn build_full_stack_xsx_pe() -> Vec<u8> {
     asm.push(Reg64::Rsi);
     asm.push(Reg64::Rdi);
     asm.sub_rsp_imm8(0x68);
+
+    // 0. Real-Time Clock (RTC) & SystemInfo check (8-core Series X Zen 2)
+    asm.lea_rip_rva(Reg64::Rcx, rva_sys_time);
+    asm.call_iat(iat_rvas["GetSystemTime"]);
+    asm.lea_rip_rva(Reg64::Rcx, rva_sys_info);
+    asm.call_iat(iat_rvas["GetSystemInfo"]);
+    asm.mov_eax_from_rva32(rva_sys_info + 32); // dw_number_of_processors
+    asm.cmp_eax_imm32(8);
+    fail.push(asm.jne_placeholder());
 
     // 1. GDK Init + XUser + XStore
     asm.call_iat(iat_rvas["XGameRuntimeInitialize"]);

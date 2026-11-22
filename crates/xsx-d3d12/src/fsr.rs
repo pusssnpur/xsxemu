@@ -330,28 +330,64 @@ pub fn process_frame(frame: &PresentedFrame, cfg: &FsrConfig) -> (PresentedFrame
 }
 
 // ===========================================================================
-// EASU — Edge-Adaptive Spatial Upsampling (12-tap directional Lanczos-2)
+// Pre-converted Padded Linear RGB+Luma Buffer & Multithreaded Row Executor
 // ===========================================================================
 
-#[inline]
-fn load_rgb_f32(src: &[u8], w: i32, h: i32, x: i32, y: i32) -> [f32; 3] {
-    let cx = x.clamp(0, w - 1) as usize;
-    let cy = y.clamp(0, h - 1) as usize;
-    let idx = (cy * (w as usize) + cx) * 4;
-    [
-        src[idx] as f32 * (1.0 / 255.0),
-        src[idx + 1] as f32 * (1.0 / 255.0),
-        src[idx + 2] as f32 * (1.0 / 255.0),
-    ]
+/// Convert RGBA8 image into a border-replicated `[r, g, b, luma]` `f32` buffer with `pad` pixels
+/// on all four sides, eliminating bounds checks, divisions, and luma recomputation in hot loops.
+fn build_padded_rgbl(src: &[u8], w: u32, h: u32, pad: usize) -> (Vec<[f32; 4]>, usize) {
+    let wu = w as usize;
+    let hu = h as usize;
+    let pw = wu + pad * 2;
+    let ph = hu + pad * 2;
+    let mut out = vec![[0.0_f32; 4]; pw * ph];
+    let inv255 = 1.0_f32 / 255.0_f32;
+
+    for y in 0..hu {
+        let src_row = y * wu * 4;
+        let dst_row = (y + pad) * pw + pad;
+        for x in 0..wu {
+            let s = src_row + x * 4;
+            let r = src[s] as f32 * inv255;
+            let g = src[s + 1] as f32 * inv255;
+            let b = src[s + 2] as f32 * inv255;
+            let l = 0.5 * r + g + 0.5 * b;
+            out[dst_row + x] = [r, g, b, l];
+        }
+        // Replicate left & right borders
+        let left = out[dst_row];
+        let right = out[dst_row + wu - 1];
+        for p in 0..pad {
+            out[dst_row - pad + p] = left;
+            out[dst_row + wu + p] = right;
+        }
+    }
+    // Replicate top & bottom border rows
+    let first_row_start = pad * pw;
+    let last_row_start = (pad + hu - 1) * pw;
+    for p in 0..pad {
+        out.copy_within(first_row_start..first_row_start + pw, p * pw);
+        out.copy_within(last_row_start..last_row_start + pw, (pad + hu + p) * pw);
+    }
+    (out, pw)
 }
 
-#[inline]
-fn luma(rgb: [f32; 3]) -> f32 {
-    // FSR green-weighted fast luminance: 0.5*R + G + 0.5*B
-    0.5 * rgb[0] + rgb[1] + 0.5 * rgb[2]
+fn worker_thread_count(rows: usize) -> usize {
+    if rows < 64 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(rows / 32)
+        .max(1)
 }
 
-#[inline]
+// ===========================================================================
+// EASU — Edge-Adaptive Spatial Upsampling (Multithreaded 12-tap Lanczos-2)
+// ===========================================================================
+
+#[inline(always)]
 fn accumulate_edge_dir(
     dir: &mut [f32; 2],
     len_acc: &mut f32,
@@ -369,14 +405,16 @@ fn accumulate_edge_dir(
 
     let max_x = (l_e - l_c).abs().max((l_c - l_w).abs());
     let len_x = if max_x > 1e-5 {
-        ((dc_x.abs() / max_x).clamp(0.0, 1.0)).powi(2)
+        let t = (dc_x.abs() / max_x).min(1.0);
+        t * t
     } else {
         0.0
     };
 
     let max_y = (l_s - l_c).abs().max((l_c - l_n).abs());
     let len_y = if max_y > 1e-5 {
-        ((dc_y.abs() / max_y).clamp(0.0, 1.0)).powi(2)
+        let t = (dc_y.abs() / max_y).min(1.0);
+        t * t
     } else {
         0.0
     };
@@ -385,7 +423,7 @@ fn accumulate_edge_dir(
 }
 
 /// Fast Lanczos-2 polynomial approximation matching AMD FSR EASU lobe shape.
-#[inline]
+#[inline(always)]
 fn easu_tap(
     acc: &mut [f32; 3],
     w_sum: &mut f32,
@@ -395,189 +433,223 @@ fn easu_tap(
     scale: [f32; 2],
     lobe: f32,
     clip: f32,
-    rgb: [f32; 3],
+    rgbl: [f32; 4],
 ) {
-    // Rotate tap offset into edge-aligned coordinate space and apply anisotropic scaling.
     let rx = (off_x * dir[0] + off_y * dir[1]) * scale[0];
     let ry = (-off_x * dir[1] + off_y * dir[0]) * scale[1];
     let d2 = (rx * rx + ry * ry).min(clip);
 
-    // Rational approximation to Lanczos-2 window with configurable negative lobe:
-    // w(d2) = ((2/5)*d2 - 1)^2 * (25/16) - (25/16 - 1)  modulated by (lobe*d2 - 1)^2
     let wb = 0.4 * d2 - 1.0;
     let wa = lobe * d2 - 1.0;
     let w = (1.5625 * wb * wb - 0.5625) * (wa * wa);
 
-    acc[0] += rgb[0] * w;
-    acc[1] += rgb[1] * w;
-    acc[2] += rgb[2] * w;
+    acc[0] += rgbl[0] * w;
+    acc[1] += rgbl[1] * w;
+    acc[2] += rgbl[2] * w;
     *w_sum += w;
 }
 
 fn easu_upscale(src: &[u8], in_w: u32, in_h: u32, out_w: u32, out_h: u32) -> Vec<u8> {
+    const PAD: usize = 2;
+    let (padded, stride) = build_padded_rgbl(src, in_w, in_h, PAD);
     let mut dst = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
-    let iw = in_w as i32;
-    let ih = in_h as i32;
+
     let scale_x = in_w as f32 / out_w as f32;
     let scale_y = in_h as f32 / out_h as f32;
+    let max_ix = (in_w as i32) - 1;
+    let max_iy = (in_h as i32) - 1;
 
-    for oy in 0..out_h {
-        let fy = (oy as f32 + 0.5) * scale_y - 0.5;
-        let iy = fy.floor() as i32;
-        let py = fy - iy as f32;
-
-        for ox in 0..out_w {
+    // Precompute X sampling coordinates once for all rows
+    let x_lut: Vec<(usize, f32)> = (0..out_w)
+        .map(|ox| {
             let fx = (ox as f32 + 0.5) * scale_x - 0.5;
             let ix = fx.floor() as i32;
             let px = fx - ix as f32;
+            let cx = (ix.clamp(-1, max_ix) + PAD as i32) as usize;
+            (cx, px)
+        })
+        .collect();
 
-            // 12-tap FSR EASU cross-diamond footprint:
-            //      b  c
-            //   e  f  g  h
-            //   i  j  k  l
-            //      n  o
-            let b = load_rgb_f32(src, iw, ih, ix, iy - 1);
-            let c = load_rgb_f32(src, iw, ih, ix + 1, iy - 1);
-            let e = load_rgb_f32(src, iw, ih, ix - 1, iy);
-            let f = load_rgb_f32(src, iw, ih, ix, iy);
-            let g = load_rgb_f32(src, iw, ih, ix + 1, iy);
-            let h = load_rgb_f32(src, iw, ih, ix + 2, iy);
-            let i = load_rgb_f32(src, iw, ih, ix - 1, iy + 1);
-            let j = load_rgb_f32(src, iw, ih, ix, iy + 1);
-            let k = load_rgb_f32(src, iw, ih, ix + 1, iy + 1);
-            let l = load_rgb_f32(src, iw, ih, ix + 2, iy + 1);
-            let n = load_rgb_f32(src, iw, ih, ix, iy + 2);
-            let o = load_rgb_f32(src, iw, ih, ix + 1, iy + 2);
+    let threads = worker_thread_count(out_h as usize);
+    let rows_per_band = (out_h as usize).div_ceil(threads);
+    let row_bytes = (out_w as usize) * 4;
+    let padded_ref = &padded;
+    let x_lut_ref = &x_lut;
 
-            let (lb, lc) = (luma(b), luma(c));
-            let (le, lf, lg, lh) = (luma(e), luma(f), luma(g), luma(h));
-            let (li, lj, lk, ll) = (luma(i), luma(j), luma(k), luma(l));
-            let (ln, lo) = (luma(n), luma(o));
+    std::thread::scope(|scope| {
+        for (band_idx, band_slice) in dst.chunks_mut(rows_per_band * row_bytes).enumerate() {
+            let start_y = band_idx * rows_per_band;
+            scope.spawn(move || {
+                let band_rows = band_slice.len() / row_bytes;
+                for local_y in 0..band_rows {
+                    let oy = (start_y + local_y) as u32;
+                    let fy = (oy as f32 + 0.5) * scale_y - 0.5;
+                    let iy = fy.floor() as i32;
+                    let py = fy - iy as f32;
+                    let cy = (iy.clamp(-1, max_iy) + PAD as i32) as usize;
 
-            // Bilinearly weight the 4 sub-quads for edge direction and strength
-            let mut dir = [0.0_f32; 2];
-            let mut len = 0.0_f32;
-            accumulate_edge_dir(&mut dir, &mut len, (1.0 - px) * (1.0 - py), lb, lj, le, lg, lf);
-            accumulate_edge_dir(&mut dir, &mut len, px * (1.0 - py), lc, lk, lf, lh, lg);
-            accumulate_edge_dir(&mut dir, &mut len, (1.0 - px) * py, lf, ln, li, lk, lj);
-            accumulate_edge_dir(&mut dir, &mut len, px * py, lg, lo, lj, ll, lk);
+                    let r_m1 = (cy - 1) * stride;
+                    let r_0 = cy * stride;
+                    let r_p1 = (cy + 1) * stride;
+                    let r_p2 = (cy + 2) * stride;
+                    let out_row = &mut band_slice[local_y * row_bytes..(local_y + 1) * row_bytes];
 
-            let dir_len2 = dir[0] * dir[0] + dir[1] * dir[1];
-            if dir_len2 < 1e-6 {
-                dir = [1.0, 0.0];
-            } else {
-                let inv = dir_len2.sqrt().recip();
-                dir[0] *= inv;
-                dir[1] *= inv;
-            }
+                    for (ox, &(cx, px)) in x_lut_ref.iter().enumerate() {
+                        let b = padded_ref[r_m1 + cx];
+                        let c = padded_ref[r_m1 + cx + 1];
+                        let e = padded_ref[r_0 + cx - 1];
+                        let f = padded_ref[r_0 + cx];
+                        let g = padded_ref[r_0 + cx + 1];
+                        let h = padded_ref[r_0 + cx + 2];
+                        let i = padded_ref[r_p1 + cx - 1];
+                        let j = padded_ref[r_p1 + cx];
+                        let k = padded_ref[r_p1 + cx + 1];
+                        let l = padded_ref[r_p1 + cx + 2];
+                        let n = padded_ref[r_p2 + cx];
+                        let o = padded_ref[r_p2 + cx + 1];
 
-            let len = (len * len).clamp(0.0, 1.0);
-            let max_dir = dir[0].abs().max(dir[1].abs()).max(1e-4);
-            let stretch = (dir[0] * dir[0] + dir[1] * dir[1]) / max_dir;
-            let aniso_scale = [
-                1.0 + (stretch - 1.0) * len,
-                1.0 - 0.5 * len,
-            ];
-            let lobe = 0.5 + (0.29 - 0.5) * len;
-            let clip = 1.0 / lobe;
+                        let mut dir = [0.0_f32; 2];
+                        let mut len = 0.0_f32;
+                        let omx = 1.0 - px;
+                        let omy = 1.0 - py;
+                        accumulate_edge_dir(&mut dir, &mut len, omx * omy, b[3], j[3], e[3], g[3], f[3]);
+                        accumulate_edge_dir(&mut dir, &mut len, px * omy, c[3], k[3], f[3], h[3], g[3]);
+                        accumulate_edge_dir(&mut dir, &mut len, omx * py, f[3], n[3], i[3], k[3], j[3]);
+                        accumulate_edge_dir(&mut dir, &mut len, px * py, g[3], o[3], j[3], l[3], k[3]);
 
-            let mut acc = [0.0_f32; 3];
-            let mut w_sum = 0.0_f32;
+                        let dir_len2 = dir[0] * dir[0] + dir[1] * dir[1];
+                        if dir_len2 < 1e-6 {
+                            dir = [1.0, 0.0];
+                        } else {
+                            let inv = dir_len2.sqrt().recip();
+                            dir[0] *= inv;
+                            dir[1] *= inv;
+                        }
 
-            easu_tap(&mut acc, &mut w_sum, 0.0 - px, -1.0 - py, dir, aniso_scale, lobe, clip, b);
-            easu_tap(&mut acc, &mut w_sum, 1.0 - px, -1.0 - py, dir, aniso_scale, lobe, clip, c);
-            easu_tap(&mut acc, &mut w_sum, -1.0 - px, 0.0 - py, dir, aniso_scale, lobe, clip, e);
-            easu_tap(&mut acc, &mut w_sum, 0.0 - px, 0.0 - py, dir, aniso_scale, lobe, clip, f);
-            easu_tap(&mut acc, &mut w_sum, 1.0 - px, 0.0 - py, dir, aniso_scale, lobe, clip, g);
-            easu_tap(&mut acc, &mut w_sum, 2.0 - px, 0.0 - py, dir, aniso_scale, lobe, clip, h);
-            easu_tap(&mut acc, &mut w_sum, -1.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, i);
-            easu_tap(&mut acc, &mut w_sum, 0.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, j);
-            easu_tap(&mut acc, &mut w_sum, 1.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, k);
-            easu_tap(&mut acc, &mut w_sum, 2.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, l);
-            easu_tap(&mut acc, &mut w_sum, 0.0 - px, 2.0 - py, dir, aniso_scale, lobe, clip, n);
-            easu_tap(&mut acc, &mut w_sum, 1.0 - px, 2.0 - py, dir, aniso_scale, lobe, clip, o);
+                        let len = (len * len).clamp(0.0, 1.0);
+                        let max_dir = dir[0].abs().max(dir[1].abs()).max(1e-4);
+                        let stretch = (dir[0] * dir[0] + dir[1] * dir[1]) / max_dir;
+                        let aniso_scale = [1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len];
+                        let lobe = 0.5 + (0.29 - 0.5) * len;
+                        let clip = 1.0 / lobe;
 
-            let inv_w = if w_sum.abs() > 1e-6 { 1.0 / w_sum } else { 1.0 };
+                        let mut acc = [0.0_f32; 3];
+                        let mut w_sum = 0.0_f32;
 
-            // Anti-ringing clamp against the 4 nearest neighbors (f, g, j, k)
-            let out_idx = ((oy as usize) * (out_w as usize) + (ox as usize)) * 4;
-            for ch in 0..3 {
-                let min4 = f[ch].min(g[ch]).min(j[ch]).min(k[ch]);
-                let max4 = f[ch].max(g[ch]).max(j[ch]).max(k[ch]);
-                let v = (acc[ch] * inv_w).clamp(min4, max4).clamp(0.0, 1.0);
-                dst[out_idx + ch] = (v * 255.0).round() as u8;
-            }
-            dst[out_idx + 3] = 255;
+                        easu_tap(&mut acc, &mut w_sum, -px, -1.0 - py, dir, aniso_scale, lobe, clip, b);
+                        easu_tap(&mut acc, &mut w_sum, 1.0 - px, -1.0 - py, dir, aniso_scale, lobe, clip, c);
+                        easu_tap(&mut acc, &mut w_sum, -1.0 - px, -py, dir, aniso_scale, lobe, clip, e);
+                        easu_tap(&mut acc, &mut w_sum, -px, -py, dir, aniso_scale, lobe, clip, f);
+                        easu_tap(&mut acc, &mut w_sum, 1.0 - px, -py, dir, aniso_scale, lobe, clip, g);
+                        easu_tap(&mut acc, &mut w_sum, 2.0 - px, -py, dir, aniso_scale, lobe, clip, h);
+                        easu_tap(&mut acc, &mut w_sum, -1.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, i);
+                        easu_tap(&mut acc, &mut w_sum, -px, 1.0 - py, dir, aniso_scale, lobe, clip, j);
+                        easu_tap(&mut acc, &mut w_sum, 1.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, k);
+                        easu_tap(&mut acc, &mut w_sum, 2.0 - px, 1.0 - py, dir, aniso_scale, lobe, clip, l);
+                        easu_tap(&mut acc, &mut w_sum, -px, 2.0 - py, dir, aniso_scale, lobe, clip, n);
+                        easu_tap(&mut acc, &mut w_sum, 1.0 - px, 2.0 - py, dir, aniso_scale, lobe, clip, o);
+
+                        let inv_w = if w_sum.abs() > 1e-6 { 1.0 / w_sum } else { 1.0 };
+                        let out_idx = ox * 4;
+                        for ch in 0..3 {
+                            let min4 = f[ch].min(g[ch]).min(j[ch]).min(k[ch]);
+                            let max4 = f[ch].max(g[ch]).max(j[ch]).max(k[ch]);
+                            let v = (acc[ch] * inv_w).clamp(min4, max4).clamp(0.0, 1.0);
+                            out_row[out_idx + ch] = (v * 255.0 + 0.5) as u8;
+                        }
+                        out_row[out_idx + 3] = 255;
+                    }
+                }
+            });
         }
-    }
+    });
 
     dst
 }
 
 // ===========================================================================
-// RCAS — Robust Contrast-Adaptive Sharpening (5-tap halo-free sharpener)
+// RCAS — Robust Contrast-Adaptive Sharpening (Multithreaded 5-tap)
 // ===========================================================================
 
 fn rcas_sharpen(src: &[u8], width: u32, height: u32, sharpness: f32) -> Vec<u8> {
+    const PAD: usize = 1;
+    let (padded, stride) = build_padded_rgbl(src, width, height, PAD);
     let mut dst = vec![0u8; src.len()];
-    let w = width as i32;
-    let h = height as i32;
-    // Map [0.0, 1.0] sharpness to AMD RCAS exponential attenuation (2^-stops)
+
     let stops = 2.0 * (1.0 - sharpness.clamp(0.0, 1.0));
     let sharp_scale = 2.0_f32.powf(-stops);
-    const RCAS_LIMIT: f32 = 0.1875; // 0.25 - 1/16 prevents ringing halos
+    const RCAS_LIMIT: f32 = 0.1875;
 
-    for y in 0..h {
-        for x in 0..w {
-            let b = load_rgb_f32(src, w, h, x, y - 1);
-            let d = load_rgb_f32(src, w, h, x - 1, y);
-            let e = load_rgb_f32(src, w, h, x, y);
-            let f = load_rgb_f32(src, w, h, x + 1, y);
-            let hh = load_rgb_f32(src, w, h, x, y + 1);
+    let wu = width as usize;
+    let hu = height as usize;
+    let row_bytes = wu * 4;
+    let threads = worker_thread_count(hu);
+    let rows_per_band = hu.div_ceil(threads);
+    let padded_ref = &padded;
 
-            let (lb, ld, le, lf, lh) = (luma(b), luma(d), luma(e), luma(f), luma(hh));
+    std::thread::scope(|scope| {
+        for (band_idx, band_slice) in dst.chunks_mut(rows_per_band * row_bytes).enumerate() {
+            let start_y = band_idx * rows_per_band;
+            scope.spawn(move || {
+                let band_rows = band_slice.len() / row_bytes;
+                for local_y in 0..band_rows {
+                    let cy = start_y + local_y + PAD;
+                    let r_up = (cy - 1) * stride;
+                    let r_mid = cy * stride;
+                    let r_dn = (cy + 1) * stride;
+                    let out_row = &mut band_slice[local_y * row_bytes..(local_y + 1) * row_bytes];
 
-            // Noise detection (attenuate sharpening on high-frequency grain)
-            let nz = (0.25 * (lb + ld + lf + lh) - le).abs();
-            let max_l = lb.max(ld).max(le).max(lf).max(lh);
-            let min_l = lb.min(ld).min(le).min(lf).min(lh);
-            let range_l = (max_l - min_l).max(1e-4);
-            let noise_factor = 1.0 - 0.5 * (nz / range_l).clamp(0.0, 1.0);
+                    for x in 0..wu {
+                        let cx = x + PAD;
+                        let b = padded_ref[r_up + cx];
+                        let d = padded_ref[r_mid + cx - 1];
+                        let e = padded_ref[r_mid + cx];
+                        let f = padded_ref[r_mid + cx + 1];
+                        let hh = padded_ref[r_dn + cx];
 
-            // Compute maximum safe negative lobe across R, G, B channels without clipping
-            let mut min_lobe = -RCAS_LIMIT;
-            for ch in 0..3 {
-                let mn4 = b[ch].min(d[ch]).min(f[ch]).min(hh[ch]);
-                let mx4 = b[ch].max(d[ch]).max(f[ch]).max(hh[ch]);
-                let mn_all = mn4.min(e[ch]);
-                let mx_all = mx4.max(e[ch]);
+                        let (lb, ld, le, lf, lh) = (b[3], d[3], e[3], f[3], hh[3]);
+                        let nz = (0.25 * (lb + ld + lf + lh) - le).abs();
+                        let max_l = lb.max(ld).max(le).max(lf).max(lh);
+                        let min_l = lb.min(ld).min(le).min(lf).min(lh);
+                        let range_l = (max_l - min_l).max(1e-4);
+                        let noise_factor = 1.0 - 0.5 * (nz / range_l).clamp(0.0, 1.0);
 
-                let hit_min = mn_all / (4.0 * mx4 + 1e-5);
-                let hit_max = (mx_all - 1.0) / (4.0 * mn4 - 4.0 - 1e-5);
-                let ch_lobe = (-hit_min).max(hit_max).clamp(-RCAS_LIMIT, 0.0);
-                if ch == 0 {
-                    min_lobe = ch_lobe;
-                } else {
-                    min_lobe = min_lobe.max(ch_lobe);
+                        let mut min_lobe = -RCAS_LIMIT;
+                        for ch in 0..3 {
+                            let mn4 = b[ch].min(d[ch]).min(f[ch]).min(hh[ch]);
+                            let mx4 = b[ch].max(d[ch]).max(f[ch]).max(hh[ch]);
+                            let mn_all = mn4.min(e[ch]);
+                            let mx_all = mx4.max(e[ch]);
+
+                            let hit_min = mn_all / (4.0 * mx4 + 1e-5);
+                            let hit_max = (mx_all - 1.0) / (4.0 * mn4 - 4.0 - 1e-5);
+                            let ch_lobe = (-hit_min).max(hit_max).clamp(-RCAS_LIMIT, 0.0);
+                            if ch == 0 {
+                                min_lobe = ch_lobe;
+                            } else {
+                                min_lobe = min_lobe.max(ch_lobe);
+                            }
+                        }
+                        let lobe = (min_lobe * sharp_scale * noise_factor).clamp(-RCAS_LIMIT, 0.0);
+                        let inv_norm = 1.0 / (4.0 * lobe + 1.0);
+
+                        let out_idx = x * 4;
+                        for ch in 0..3 {
+                            let val = (lobe * (b[ch] + d[ch] + f[ch] + hh[ch]) + e[ch]) * inv_norm;
+                            out_row[out_idx + ch] = (val.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        }
+                        out_row[out_idx + 3] = 255;
+                    }
                 }
-            }
-            let lobe = (min_lobe * sharp_scale * noise_factor).clamp(-RCAS_LIMIT, 0.0);
-            let inv_norm = 1.0 / (4.0 * lobe + 1.0);
-
-            let out_idx = ((y as usize) * (width as usize) + (x as usize)) * 4;
-            for ch in 0..3 {
-                let val = (lobe * (b[ch] + d[ch] + f[ch] + hh[ch]) + e[ch]) * inv_norm;
-                dst[out_idx + ch] = (val.clamp(0.0, 1.0) * 255.0).round() as u8;
-            }
-            dst[out_idx + 3] = 255;
+            });
         }
-    }
+    });
 
     dst
 }
 
 // ===========================================================================
-// Native Windows Direct3D 12 Compute Shader Sources (HLSL SM 6.0)
+// Native Windows Direct3D 12 Compute & Graphics Shader Sources (HLSL)
 // ===========================================================================
 
 /// Clean-room HLSL compute shader for native D3D12 EASU upscaling pass.
