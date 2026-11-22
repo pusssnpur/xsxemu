@@ -27,18 +27,62 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design specificati
 cargo test --workspace
 ```
 
-### Generate, Inspect, and Execute the Vertical-Slice Sample
+### Generate, Inspect, and Execute the Samples
 
 ```bash
-# 1. Generate a synthetic Xbox Series X PE32+ test executable
+# Vertical-slice single-binary sample (FSR Quality 1.5x enabled by default -> 960x540)
 cargo run -p xsxemu -- gen-sample hello_xsx.exe
-
-# 2. Inspect PE32+ headers, sections, Xbox DLL imports, and base relocations
 cargo run -p xsxemu -- inspect hello_xsx.exe
-
-# 3. Execute natively with call tracing and dump the PresentX framebuffer
 cargo run -p xsxemu -- run hello_xsx.exe --trace --force-relocate --dump-frame frame.bmp
+
+# Phase 2 multi-module suite (secondary guest DLL, TLS callbacks, .pdata, Xbox T:\ VFS, threads, FSR)
+cargo run -p xsxemu -- gen-phase2 ./phase2_out
+cargo run -p xsxemu -- inspect ./phase2_out/xsx_helper.dll
+cargo run -p xsxemu -- inspect ./phase2_out/phase2_xsx.exe
+cargo run -p xsxemu -- run ./phase2_out/phase2_xsx.exe --trace --force-relocate --dump-frame fsr_frame.bmp
+
+# Phase 3 + Phase 4 + Phase 5 full-stack suite (RTC, DXBC MD5 + ShaderCache, PSO/Dispatch, DirectStorage, XInput, XAudio2 WAV, XUser, XGameSave, multithreaded FSR)
+cargo run --release -p xsxemu -- gen-fullstack ./fullstack_out
+cargo run --release -p xsxemu -- run ./fullstack_out/full_stack_xsx.exe \
+  --trace --force-relocate --rtc-offset 0 \
+  --shader-cache ./shader_cache \
+  --dump-frame fullstack_fsr.bmp --dump-audio fullstack_audio.wav
+
+# Benchmark multithreaded AMD FSR (EASU + RCAS)
+cargo run --release -p xsxemu -- bench-fsr --width 1280 --height 720 --fsr quality
+
+# Real-game Xbox Series X ABI suite (d3d12_xs 84-slot proxy, xgameruntime QueryApiImpl, xmem, CoW GAME:\ overlay, --dry-run, JSONL trace)
+cargo run -p xsxemu -- gen-realgame ./realgame_out
+cargo run -p xsxemu -- run ./realgame_out/realgame_xsx.exe --dry-run
+cargo run -p xsxemu -- run ./realgame_out/realgame_xsx.exe \
+  --game-dir ./realgame_out --overlay ./realgame_overlay \
+  --unimplemented fail --trace-jsonl ./startup.jsonl --trace
+
+# Inspect real Xbox Series X DXBC / XDAT / XBCH / FSSM / FSPX shader containers
+cargo run -p xsxemu -- inspect-shader <shader.bin>
 ```
+
+### Real-Game Xbox Series X Compatibility Features
+
+- **Measured `d3d12_xs.dll` ABI Proxy (`crates/xsx-d3d12/src/xs_proxy.rs`, `rootsig.rs`)**:
+  - 84-slot `ID3D12Device` proxy covering `ID3D12Device`..`ID3D12Device14` with measured Xbox Series X deviations: **Slot 62** (`CreateComputePipelineState` with 2 extra words), **Slot 67** (`DeserializeComputePipelineStateX` for FSPX native RDNA 2 compute shaders), **Slot 76** (`CreateCommittedResource` rewriting Xbox `0x101`/`0x1` layout words), and **Heap Slots 9/10** returning 8-byte CPU/GPU descriptor handles directly in `RAX`.
+  - Root signature high-byte Xbox flag stripping (`0xFF00_0000`, observed `0x0300_0000`) on legacy, versioned (1.0/1.1/1.2), and serialized `DXBC`/`RTS0` blobs (with exact Microsoft `d3dcompiler` DXBC MD5-variant checksum recomputation), plus automatic v1.2 → v1.1 downgrade.
+- **AMD RDNA 2 Shaders, Descriptors, Tiling & Hardware BCPack (`rdna2_shader.rs`, `gfx10_desc.rs`, `tiling.rs`, `bcpack/`)**:
+  - Zero-dependency RFC 1950/1951 zlib inflater + SHA-256 to unpack real Xbox Series X `DXBC` → `DXIL` → `XDAT` → `0x0D` `XBCH` → `FSSM` RDNA 2 programs and FidelityFX `FSPX` compute containers.
+  - AMD GFX10/RDNA 2 `T#`/`S#`/`V#` descriptor encoder/decoder, 64 KiB/4 KiB `GetResourceTiling` calculator, 64 KiB `SW_64KB_S`/`R_X` 2D texture swizzle & detile engine, and cycle-accurate Xbox Series X BCPack MDU rANS texture decoder.
+  - Xbox Presentation **Frame Pacer** (`SetFrameIntervalX`, `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX`, `PresentX` token tracking & `ImmediateThresholdPercent` tearing logic, `SuspendX`/`ResumeX`).
+- **Real GDK Runtime, `xmem.dll`, CRT Startup & Non-Destructive CoW VFS (`crates/xsx-hle`)**:
+  - `xgameruntime.lib` dynamic bootstrap (`LoadLibraryW("xgameruntime.dll")` pseudo-handles + `InitializeApiImplEx2` + `QueryApiImpl` serving `IXThreadingImpl`, `IXErrorImpl`, and `IXNetworkingImpl2` COM singletons + in-process `XTaskQueue`/`XAsync` + `XPackage`/`XSystem`).
+  - `xmem.dll` (`XMemAlloc` 64-byte aligned, `XMemFree`, `XMemVirtualAlloc` 64 KiB page mode, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemGetWriteWatch`/`ResetWriteWatch`).
+  - Non-destructive `GAME:\` Copy-on-Write VFS overlay (`--overlay`) with `.xsxemu-deleted` tombstones so retail game packages are never modified, plus `--dry-run`, `--unimplemented <log|fail|stop>` HRESULT classification, and crash-safe `--trace-jsonl`.
+
+### AMD FSR Upscaling (Enabled by Default)
+
+`xsxemu` incorporates **AMD FidelityFX Super Resolution (FSR)** — **EASU** (12-tap edge-adaptive spatial upsampling) + **RCAS** (5-tap contrast-adaptive sharpening) — directly into the `PresentX` presentation pipeline **by default** (`--fsr quality`, 1.5x scale, sharpness `0.8`):
+
+- `--fsr <ultra-quality|quality|balanced|performance|ultra-performance|native-aa|off>`
+- `--fsr-sharpness <0.0..=1.0>` (default `0.8`)
+- `--output-res <WxH>` (e.g. `1920x1080`, `3840x2160`)
 
 ### Selecting a GPU Backend
 
@@ -46,6 +90,6 @@ cargo run -p xsxemu -- run hello_xsx.exe --trace --force-relocate --dump-frame f
 - `--backend d3d12`: Requires Windows x86_64 with hardware/WARP Direct3D 12 support.
 - `--backend software`: Uses the deterministic software D3D12 command executor and triangle rasterizer.
 
-## License
+## License & Third-Party Notices
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). The BCPack MDU rANS entropy decoder in `crates/xsx-d3d12/src/bcpack/` is MIT OR Apache-2.0 licensed (see `crates/xsx-d3d12/src/bcpack/THIRD_PARTY_NOTICES.md`).
