@@ -122,7 +122,7 @@ impl SoftwareD3D12Backend {
         // Read vertices from the guest/resource memory at vb.buffer_location
         let stride = vb.stride_in_bytes as usize;
         let max_verts = (vb.size_in_bytes as usize) / stride;
-        let end_vert = ((start_vertex + vertex_count) as usize).min(max_verts);
+        let end_vert = ((start_vertex.saturating_add(vertex_count)) as usize).min(max_verts);
         let start = start_vertex as usize;
         if end_vert <= start {
             return;
@@ -310,42 +310,55 @@ fn rasterize_triangle(
 
     let (sx0, sy0, sx1, sy1) = match scissor {
         Some(s) => (
-            min_x.max(s.left),
-            min_y.max(s.top),
-            max_x.min(s.right - 1),
-            max_y.min(s.bottom - 1),
+            min_x.max(s.left).max(0),
+            min_y.max(s.top).max(0),
+            max_x.min(s.right.saturating_sub(1)).min(res.width as i32 - 1),
+            max_y.min(s.bottom.saturating_sub(1)).min(res.height as i32 - 1),
         ),
         None => (min_x, min_y, max_x, max_y),
     };
+    if sx0 > sx1 || sy0 > sy1 {
+        return;
+    }
+
+    let inv_area = 1.0 / area;
+    let sign = if area > 0.0 { 1.0_f32 } else { -1.0_f32 };
+    let (step_x0, step_y0) = (y2 - y1, x1 - x2);
+    let (step_x1, step_y1) = (y0 - y2, x2 - x0);
+    let (step_x2, step_y2) = (y1 - y0, x0 - x1);
+
+    let start_px = sx0 as f32 + 0.5;
+    let mut row_w0 = edge_fn(x1, y1, x2, y2, start_px, sy0 as f32 + 0.5);
+    let mut row_w1 = edge_fn(x2, y2, x0, y0, start_px, sy0 as f32 + 0.5);
+    let mut row_w2 = edge_fn(x0, y0, x1, y1, start_px, sy0 as f32 + 0.5);
+    let stride = res.width as usize;
 
     for y in sy0..=sy1 {
+        let mut w0 = row_w0;
+        let mut w1 = row_w1;
+        let mut w2 = row_w2;
+        let row_off = (y as usize) * stride;
         for x in sx0..=sx1 {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let w0 = edge_fn(x1, y1, x2, y2, px, py);
-            let w1 = edge_fn(x2, y2, x0, y0, px, py);
-            let w2 = edge_fn(x0, y0, x1, y1, px, py);
-
-            let inside = if area > 0.0 {
-                w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0
-            } else {
-                w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0
-            };
-
-            if inside {
-                let b0 = w0 / area;
-                let b1 = w1 / area;
-                let b2 = w2 / area;
+            if w0 * sign >= 0.0 && w1 * sign >= 0.0 && w2 * sign >= 0.0 {
+                let b0 = w0 * inv_area;
+                let b1 = w1 * inv_area;
+                let b2 = w2 * inv_area;
                 let r = b0 * v0.color[0] + b1 * v1.color[0] + b2 * v2.color[0];
                 let g = b0 * v0.color[1] + b1 * v1.color[1] + b2 * v2.color[1];
                 let b = b0 * v0.color[2] + b1 * v1.color[2] + b2 * v2.color[2];
                 let a = b0 * v0.color[3] + b1 * v1.color[3] + b2 * v2.color[3];
-                let idx = ((y as u32 * res.width + x as u32) * 4) as usize;
+                let idx = (row_off + x as usize) * 4;
                 res.data[idx] = float_to_u8(r);
                 res.data[idx + 1] = float_to_u8(g);
                 res.data[idx + 2] = float_to_u8(b);
                 res.data[idx + 3] = float_to_u8(a);
             }
+            w0 += step_x0;
+            w1 += step_x1;
+            w2 += step_x2;
         }
+        row_w0 += step_y0;
+        row_w1 += step_y1;
+        row_w2 += step_y2;
     }
 }

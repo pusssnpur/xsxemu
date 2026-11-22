@@ -494,6 +494,17 @@ impl PeImage {
             String::new()
         };
 
+        let funcs_off = self.rva_to_file_offset(addr_funcs_rva)?;
+        let funcs_bytes = num_functions
+            .checked_mul(4)
+            .ok_or(PeError::MalformedTable("Export.NumberOfFunctions overflow"))?;
+        if funcs_off
+            .checked_add(funcs_bytes)
+            .is_none_or(|end| end > self.raw_bytes.len())
+        {
+            return Err(PeError::Truncated("ExportFunctionTable"));
+        }
+
         // Map function-table index -> export name
         let mut names_by_idx: Vec<Option<String>> = vec![None; num_functions];
         if num_names > 0 && addr_names_rva != 0 && addr_ords_rva != 0 {
@@ -508,7 +519,6 @@ impl PeImage {
             }
         }
 
-        let funcs_off = self.rva_to_file_offset(addr_funcs_rva)?;
         let dir_start = dir.virtual_address;
         let dir_end = dir.virtual_address.saturating_add(dir.size);
         let mut entries = Vec::with_capacity(num_functions);
@@ -524,7 +534,7 @@ impl PeImage {
                 None
             };
             entries.push(ExportEntry {
-                ordinal: (ordinal_base + idx as u32) as u16,
+                ordinal: ordinal_base.wrapping_add(idx as u32) as u16,
                 name: names_by_idx[idx].take(),
                 rva: fn_rva,
                 forwarder,

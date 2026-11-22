@@ -747,6 +747,7 @@ fn json_str(json: &str, key: &str) -> Option<String> {
             match chars.next()? {
                 '"' => out.push('"'),
                 '\\' => out.push('\\'),
+                '/' => out.push('/'),
                 'n' => out.push('\n'),
                 'r' => out.push('\r'),
                 't' => out.push('\t'),
@@ -828,7 +829,9 @@ mod win32 {
     const WM_CREATE: u32 = 0x0001;
     const WM_DESTROY: u32 = 0x0002;
     const WM_PAINT: u32 = 0x000F;
+    const WM_SETFONT: u32 = 0x0030;
     const WM_COMMAND: u32 = 0x0111;
+    const DEFAULT_GUI_FONT: i32 = 17;
     const SW_SHOW: i32 = 5;
     const SRCCOPY: u32 = 0x00CC_0020;
     const DIB_RGB_COLORS: u32 = 0;
@@ -984,6 +987,7 @@ mod win32 {
 
     #[link(name = "gdi32")]
     extern "system" {
+        fn GetStockObject(i: i32) -> isize;
         fn StretchDIBits(
             hdc: isize,
             xDest: i32,
@@ -1069,10 +1073,15 @@ mod win32 {
         match msg {
             WM_CREATE => {
                 let hinst = GetModuleHandleW(std::ptr::null());
+                let font = GetStockObject(DEFAULT_GUI_FONT) as usize;
                 let mk = |cls: &str, txt: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: isize| {
                     let c = wide(cls);
                     let t = wide(txt);
-                    CreateWindowExW(0, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style, x, y, w, h, hwnd, id, hinst, std::ptr::null_mut())
+                    let ctrl = CreateWindowExW(0, c.as_ptr(), t.as_ptr(), WS_CHILD | WS_VISIBLE | style, x, y, w, h, hwnd, id, hinst, std::ptr::null_mut());
+                    if font != 0 && ctrl != 0 {
+                        SendMessageW(ctrl, WM_SETFONT, font, 0);
+                    }
+                    ctrl
                 };
                 mk("STATIC", "Package / EXE:", 0, 14, 16, 110, 22, 0);
                 mk("EDIT", "", WS_BORDER, 128, 14, 580, 24, ID_PATH_EDIT);

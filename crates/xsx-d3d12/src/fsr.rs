@@ -754,6 +754,9 @@ fn fsr_pipeline(
     run_rcas: bool,
     sharpness: f32,
 ) -> Vec<u8> {
+    if in_w == 0 || in_h == 0 || out_w == 0 || out_h == 0 {
+        return Vec::new();
+    }
     let (iw, ih, ow, oh) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
     let mut dst = vec![0u8; ow * oh * 4];
     if !run_easu && !run_rcas {

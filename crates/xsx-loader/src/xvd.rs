@@ -6,7 +6,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 pub const XVD_MAGIC: &[u8; 8] = b"msft-xvd";
@@ -96,11 +96,14 @@ impl XvdContainer {
         let mut f = File::open(path)
             .map_err(|e| XvdError::Io(format!("{}: {e}", path.display())))?;
         let mut hdr = vec![0u8; XVD_MIN_HEADER_SIZE];
-        let n = f
-            .read(&mut hdr)
-            .map_err(|e| XvdError::Io(format!("{}: {e}", path.display())))?;
-        if n < XVD_MIN_HEADER_SIZE {
-            return Err(XvdError::Truncated(n));
+        let mut read_total = 0usize;
+        while read_total < XVD_MIN_HEADER_SIZE {
+            match f.read(&mut hdr[read_total..]) {
+                Ok(0) => return Err(XvdError::Truncated(read_total)),
+                Ok(n) => read_total += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(XvdError::Io(format!("{}: {e}", path.display()))),
+            }
         }
         let header = parse_xvd_header(&hdr)?;
         Ok(Self {
@@ -138,11 +141,26 @@ impl XvdContainer {
         if size == 0 {
             return Ok(Vec::new());
         }
-        let abs = self.header.user_data_offset + offset;
+        let abs = self
+            .header
+            .user_data_offset
+            .checked_add(offset)
+            .ok_or(XvdError::OutOfBounds {
+                offset,
+                size,
+                limit: self.header.user_data_length,
+            })?;
+        let size_usize = usize::try_from(size).map_err(|_| XvdError::OutOfBounds {
+            offset,
+            size,
+            limit: self.header.user_data_length,
+        })?;
         match &self.backing {
             XvdBacking::Memory(buf) => {
-                let start = abs as usize;
-                let end = start.saturating_add(size as usize);
+                let start = usize::try_from(abs).map_err(|_| XvdError::Truncated(buf.len()))?;
+                let end = start
+                    .checked_add(size_usize)
+                    .ok_or(XvdError::Truncated(buf.len()))?;
                 if end > buf.len() {
                     return Err(XvdError::Truncated(buf.len()));
                 }
@@ -153,7 +171,7 @@ impl XvdContainer {
                     .map_err(|e| XvdError::Io(format!("{}: {e}", path.display())))?;
                 f.seek(SeekFrom::Start(abs))
                     .map_err(|e| XvdError::Io(format!("{}: {e}", path.display())))?;
-                let mut out = vec![0u8; size as usize];
+                let mut out = vec![0u8; size_usize];
                 f.read_exact(&mut out)
                     .map_err(|e| XvdError::Io(format!("{}: {e}", path.display())))?;
                 Ok(out)

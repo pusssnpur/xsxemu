@@ -202,6 +202,7 @@ unsafe extern "win64" fn unimplemented_stub_hresult() -> i32 {
 pub struct ModuleRegistry {
     exports: HashMap<(String, String), usize>,
     ordinals: HashMap<(String, u16), usize>,
+    owned_dlls: HashSet<String>,
     allow_stubs: bool,
     policy: UnimplementedPolicy,
 }
@@ -216,6 +217,7 @@ impl ModuleRegistry {
         let mut reg = Self {
             exports: HashMap::new(),
             ordinals: HashMap::new(),
+            owned_dlls: HashSet::new(),
             allow_stubs,
             policy,
         };
@@ -236,12 +238,15 @@ impl ModuleRegistry {
     }
 
     pub fn register_export(&mut self, dll: &str, name: &str, addr: usize) {
-        self.exports
-            .insert((normalize_dll(dll), name.to_string()), addr);
+        let norm = normalize_dll(dll);
+        self.owned_dlls.insert(norm.clone());
+        self.exports.insert((norm, name.to_string()), addr);
     }
 
     pub fn register_ordinal(&mut self, dll: &str, ordinal: u16, addr: usize) {
-        self.ordinals.insert((normalize_dll(dll), ordinal), addr);
+        let norm = normalize_dll(dll);
+        self.owned_dlls.insert(norm.clone());
+        self.ordinals.insert((norm, ordinal), addr);
     }
 
     pub fn export_count(&self) -> usize {
@@ -264,8 +269,7 @@ impl ModuleRegistry {
     /// and `GetModuleHandleA/W` return a pseudo-handle instead of falling through).
     pub fn owns_dll(&self, dll: &str) -> bool {
         let norm = normalize_dll(dll);
-        self.exports.keys().any(|(d, _)| d == &norm)
-            || self.ordinals.keys().any(|(d, _)| d == &norm)
+        self.owned_dlls.contains(&norm)
     }
 }
 

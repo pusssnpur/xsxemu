@@ -442,6 +442,10 @@ fn register_pdata_table(pe: &PeImage, memory: &VirtualMemory) -> Option<usize> {
     if count == 0 {
         return None;
     }
+    let end = (dir.virtual_address as usize).checked_add(count * 12)?;
+    if end > memory.len() {
+        return None;
+    }
     #[link(name = "kernel32")]
     extern "system" {
         fn RtlAddFunctionTable(

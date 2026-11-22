@@ -103,7 +103,11 @@ impl ShaderContainer {
             }
             let fourcc: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
             let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
-            if off + 8 + size > bytes.len() {
+            let chunk_end = off
+                .checked_add(8)
+                .and_then(|v| v.checked_add(size))
+                .ok_or(ShaderError::ChunkOutOfBounds { index: i, offset: off })?;
+            if chunk_end > bytes.len() {
                 return Err(ShaderError::ChunkOutOfBounds { index: i, offset: off });
             }
             chunks.push(ShaderChunk {

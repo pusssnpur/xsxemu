@@ -897,9 +897,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "DRY-RUN {}  preferred=0x{:016X} size=0x{:X} entry=+0x{:X}",
             main_name, pe.image_base, pe.size_of_image, pe.entry_point_rva
         );
+        let strict = ModuleRegistry::with_policy(false, unimplemented_policy);
         for desc in pe.imports.iter().chain(pe.delay_imports.iter()) {
             for entry in &desc.entries {
-                let strict = ModuleRegistry::with_policy(false, unimplemented_policy);
                 if xsx_loader::ImportResolver::resolve(&strict, &desc.dll_name, &entry.symbol)
                     .is_some()
                 {
