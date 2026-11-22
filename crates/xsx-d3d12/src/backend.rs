@@ -137,8 +137,8 @@ impl PresentedFrame {
         f.write_all(&rgb)
     }
 
-    /// Save this RGBA8 framebuffer as an uncompressed 24-bit Windows BMP image.
-    pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
+    /// Encode this RGBA8 framebuffer as an uncompressed 24-bit Windows BMP byte buffer.
+    pub fn encode_bmp(&self) -> Vec<u8> {
         let row_stride = ((self.width * 3 + 3) & !3) as usize;
         let pixel_bytes = row_stride * self.height as usize;
         let file_size = 54 + pixel_bytes;
@@ -172,7 +172,12 @@ impl PresentedFrame {
                 buf.push(0);
             }
         }
+        buf
+    }
 
+    /// Save this RGBA8 framebuffer as an uncompressed 24-bit Windows BMP image.
+    pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
+        let buf = self.encode_bmp();
         let mut f = File::create(path)?;
         f.write_all(&buf)
     }

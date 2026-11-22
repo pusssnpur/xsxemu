@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use xsx_d3d12::fsr::process_frame;
 use xsx_d3d12::{
     disassemble_rdna2, extract_fssm_program, extract_fspx_parts, format_rdna2_disassembly,
     inspect_xbox_shader_blob, lift_rdna2_to_hlsl, BackendKind, FsrConfig, FsrQualityMode,
-    PresentedFrame, ShaderStage, TranslatorConfig,
+    ShaderStage, TranslatorConfig,
 };
 use xsx_hle::{
     classify_import_return_class, set_active_title_id, set_guest_command_line,
@@ -24,12 +23,14 @@ use xsx_testgen::{
     build_full_stack_xsx_pe, build_hello_xsx_pe, build_helper_dll_pe, build_phase2_xsx_pe,
     build_real_game_xsx_pe, FULLSTACK_ASSET_PAYLOAD, REALGAME_PKG_CONFIG,
 };
+use xsxemu::gui::{launch_gui, GuiOptions};
 
 fn print_usage() {
     eprintln!(
         "xsxemu — Clean-room Xbox Series X|S Game Translation Layer (v{})\n\
          \n\
          USAGE:\n\
+           xsxemu gui [--web] [--port PORT] [--no-browser]\n\
            xsxemu gen-sample <output.exe>\n\
            xsxemu gen-phase2 <output_dir>\n\
            xsxemu gen-fullstack <output_dir>\n\
@@ -41,7 +42,7 @@ fn print_usage() {
            xsxemu lift-hlsl <shader.bin> [--stage vs|ps|cs]\n\
            xsxemu boot <package_dir> [RUN OPTIONS] [-- guest-args...]\n\
            xsxemu run <binary.exe> [RUN OPTIONS] [-- guest-args...]\n\
-           xsxemu bench-fsr [--width W] [--height H] [--fsr MODE]\n\
+           xsxemu bench-fsr [--width W] [--height H] [--fsr MODE] [--iters N]\n\
          \n\
          RUN OPTIONS:\n\
            --dry-run                             Map image & print import/HRESULT coverage without executing code\n\
@@ -77,6 +78,7 @@ fn main() -> ExitCode {
     }
 
     match args[0].as_str() {
+        "gui" => cmd_gui(&args[1..]),
         "gen-sample" => cmd_gen_sample(&args[1..]),
         "gen-phase2" => cmd_gen_phase2(&args[1..]),
         "gen-fullstack" => cmd_gen_fullstack(&args[1..]),
@@ -99,6 +101,36 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn cmd_gui(args: &[String]) -> ExitCode {
+    let mut opts = GuiOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--web" => opts.web_only = true,
+            "--no-browser" => opts.open_browser = false,
+            "--port" => {
+                i += 1;
+                if let Some(p) = args.get(i).and_then(|s| s.parse::<u16>().ok()) {
+                    opts.port = p;
+                } else {
+                    eprintln!("--port requires a valid TCP port (0..=65535)");
+                    return ExitCode::from(2);
+                }
+            }
+            other => {
+                eprintln!("unknown gui option: {other}");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    if let Err(e) = launch_gui(opts) {
+        eprintln!("GUI error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
 }
 
 fn cmd_gen_sample(args: &[String]) -> ExitCode {
@@ -414,10 +446,17 @@ fn cmd_bench_fsr(args: &[String]) -> ExitCode {
     let mut width: u32 = 1280;
     let mut height: u32 = 720;
     let mut fsr = FsrConfig::default();
+    let mut iters: u32 = 5;
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--iters" => {
+                i += 1;
+                if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
+                    iters = v;
+                }
+            }
             "--width" => {
                 i += 1;
                 if let Some(v) = args.get(i).and_then(|s| s.parse().ok()) {
@@ -441,37 +480,22 @@ fn cmd_bench_fsr(args: &[String]) -> ExitCode {
         i += 1;
     }
 
-    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let idx = ((y * width + x) * 4) as usize;
-            rgba[idx] = ((x * 255) / width.max(1)) as u8;
-            rgba[idx + 1] = ((y * 255) / height.max(1)) as u8;
-            rgba[idx + 2] = if (x ^ y) & 32 != 0 { 220 } else { 40 };
-            rgba[idx + 3] = 255;
-        }
-    }
-    let frame = PresentedFrame {
-        frame_index: 0,
-        width,
-        height,
-        rgba,
-    };
+    let frame = xsx_d3d12::fsr::test_pattern(width.max(1), height.max(1));
 
-    let (out, stats) = process_frame(&frame, &fsr);
-    let ms = stats.duration_us as f64 / 1000.0;
-    let fps = if ms > 0.0 { 1000.0 / ms } else { 0.0 };
+    let r = xsx_d3d12::fsr::bench_frame(&frame, &fsr, iters);
     println!(
-        "FSR Benchmark ({}): {}x{} -> {}x{} | EASU={} RCAS={} | {:.2} ms ({:.1} FPS, {} threads)",
-        stats.mode.name(),
+        "FSR Benchmark ({}): {}x{} -> {}x{} | EASU={} RCAS={} | avg {:.2} ms, min {:.2} ms ({:.1} FPS avg, {} iters, {} threads)",
+        r.mode.name(),
         width,
         height,
-        out.width,
-        out.height,
-        stats.easu_ran,
-        stats.rcas_ran,
-        ms,
-        fps,
+        r.output_width,
+        r.output_height,
+        r.easu_ran,
+        r.rcas_ran,
+        r.avg_ms,
+        r.min_ms,
+        r.fps(),
+        r.iterations,
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)

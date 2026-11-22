@@ -6,6 +6,8 @@ use std::path::Path;
 
 pub const OUTPUT_SAMPLE_RATE: u32 = 48_000;
 pub const OUTPUT_CHANNELS: u16 = 2;
+/// Captured telemetry cap: 2 Mi interleaved samples = 4 MiB (~21 s of 48 kHz stereo).
+const MAX_CAPTURE_SAMPLES: usize = 2 * 1024 * 1024;
 
 /// Software stereo mixer backing `XAudio2_9.dll` voices, with optional live Windows playback
 /// and deterministic RIFF/WAVE `.wav` export.
@@ -15,6 +17,8 @@ pub struct AudioMixer {
     /// Interleaved 48 kHz 16-bit stereo PCM frames (`L, R, L, R, ...`).
     mixed_i16: Vec<i16>,
     total_frames_mixed: u64,
+    /// Reused per-submit resample buffer (avoids a heap allocation per voice submit).
+    scratch: Vec<i16>,
 }
 
 impl Default for AudioMixer {
@@ -30,6 +34,7 @@ impl AudioMixer {
             live_output_enabled,
             mixed_i16: Vec::new(),
             total_frames_mixed: 0,
+            scratch: Vec::new(),
         }
     }
 
@@ -68,22 +73,43 @@ impl AudioMixer {
         let ratio = in_rate / (OUTPUT_SAMPLE_RATE as f64);
         let out_frames = ((in_frames as f64) / ratio).round().max(1.0) as usize;
 
+        // Fast exit: nothing will observe the samples (no live output, capture buffer full).
+        let capture_has_room = self.mixed_i16.len() + out_frames * 2 <= MAX_CAPTURE_SAMPLES;
+        if !self.live_output_enabled && !capture_has_room {
+            self.total_frames_mixed += out_frames as u64;
+            return out_frames as u64;
+        }
+
         let gain = (self.master_volume * voice_volume.clamp(0.0, 4.0)) / 32768.0;
-        let mut chunk_out = Vec::with_capacity(out_frames * 2);
+        let mut chunk_out = std::mem::take(&mut self.scratch);
+        chunk_out.clear();
+        chunk_out.reserve(out_frames * 2);
 
-        for o in 0..out_frames {
-            let src_pos = (o as f64) * ratio;
-            let idx0 = (src_pos.floor() as usize).min(in_frames - 1);
-            let idx1 = (idx0 + 1).min(in_frames - 1);
-            let frac = (src_pos - idx0 as f64) as f32;
+        if src_sample_rate == OUTPUT_SAMPLE_RATE && out_frames == in_frames {
+            // 48 kHz pass-through: no interpolation needed.
+            for frame in raw_bytes[..in_frames * bytes_per_frame].chunks_exact(bytes_per_frame) {
+                let l = i16::from_le_bytes([frame[0], frame[1]]);
+                let r = if ch == 2 { i16::from_le_bytes([frame[2], frame[3]]) } else { l };
+                chunk_out.push(f32_to_i16_soft_clip(l as f32 * gain));
+                chunk_out.push(f32_to_i16_soft_clip(r as f32 * gain));
+            }
+        } else {
+            let last = in_frames - 1;
+            let mut src_pos = 0.0_f64;
+            for _ in 0..out_frames {
+                let idx0 = (src_pos as usize).min(last);
+                let idx1 = (idx0 + 1).min(last);
+                let frac = (src_pos - idx0 as f64).clamp(0.0, 1.0) as f32;
+                src_pos += ratio;
 
-            let (l0, r0) = read_frame_i16(raw_bytes, idx0, ch);
-            let (l1, r1) = read_frame_i16(raw_bytes, idx1, ch);
-            let l = ((l0 as f32) * (1.0 - frac) + (l1 as f32) * frac) * gain;
-            let r = ((r0 as f32) * (1.0 - frac) + (r1 as f32) * frac) * gain;
+                let (l0, r0) = read_frame_i16(raw_bytes, idx0, ch);
+                let (l1, r1) = read_frame_i16(raw_bytes, idx1, ch);
+                let l = ((l0 as f32) + ((l1 as f32) - (l0 as f32)) * frac) * gain;
+                let r = ((r0 as f32) + ((r1 as f32) - (r0 as f32)) * frac) * gain;
 
-            chunk_out.push(f32_to_i16_soft_clip(l));
-            chunk_out.push(f32_to_i16_soft_clip(r));
+                chunk_out.push(f32_to_i16_soft_clip(l));
+                chunk_out.push(f32_to_i16_soft_clip(r));
+            }
         }
 
         if self.live_output_enabled {
@@ -91,9 +117,10 @@ impl AudioMixer {
         }
 
         // Cap captured telemetry buffer to 4 MiB (~21 seconds of 48 kHz stereo)
-        if self.mixed_i16.len() + chunk_out.len() <= 2 * 1024 * 1024 {
+        if capture_has_room {
             self.mixed_i16.extend_from_slice(&chunk_out);
         }
+        self.scratch = chunk_out;
         self.total_frames_mixed += out_frames as u64;
         out_frames as u64
     }
@@ -264,5 +291,22 @@ mod tests {
         assert_eq!(&wav[8..12], b"WAVE");
         assert_eq!(wav.len(), 44 + 240 * 4);
         let _ = std::fs::remove_file(&wav_path);
+    }
+
+    #[test]
+    fn passthrough_48k_and_capture_cap_fast_paths() {
+        let mut mixer = AudioMixer::new(false);
+        let pcm = generate_sine_pcm16(1000.0, 48_000, 480, 0.25);
+        assert_eq!(mixer.submit_pcm16(&pcm, 2, 48_000, 1.0), 480);
+        assert_eq!(mixer.pcm_byte_len(), 480 * 4);
+        // Passthrough at unity gain reproduces the input samples (within 1 LSB of 32767/32768 scaling).
+        let first_in = i16::from_le_bytes([pcm[40], pcm[41]]);
+        assert!((mixer.mixed_i16[20] as i32 - first_in as i32).abs() <= 1);
+        // Fill the capture buffer; further submits only advance the frame counter.
+        let big = vec![0u8; (MAX_CAPTURE_SAMPLES - mixer.mixed_i16.len()) * 2];
+        mixer.submit_pcm16(&big, 2, 48_000, 1.0);
+        let len_before = mixer.pcm_byte_len();
+        assert_eq!(mixer.submit_pcm16(&pcm, 2, 48_000, 1.0), 480);
+        assert_eq!(mixer.pcm_byte_len(), len_before);
     }
 }

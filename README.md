@@ -27,6 +27,17 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design specificati
 cargo test --workspace
 ```
 
+### Launch the GUI (`xsxemu gui`)
+
+```bash
+# On Windows: opens native Win32 desktop launcher (plus optional Web Dashboard button)
+# On Linux / cross-platform: opens embedded zero-dependency Web GUI in browser
+cargo run --release -p xsxemu -- gui
+
+# Force embedded Web Dashboard on a custom port without auto-opening browser
+cargo run --release -p xsxemu -- gui --web --port 8080 --no-browser
+```
+
 ### Generate, Inspect, and Execute the Samples
 
 ```bash

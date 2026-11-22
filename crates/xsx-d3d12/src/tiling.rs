@@ -336,6 +336,62 @@ impl SwizzleEquation {
     }
 }
 
+/// Precomputed per-column / per-row address tables for a [`SwizzleEquation`].
+///
+/// Because every address bit is `parity(x & mx) ^ parity(y & my)`, the intra-block
+/// offset is *linear over XOR*: `intra(x, y) = intra(x, 0) ^ intra(0, y)`. Block
+/// offsets are multiples of `block_bytes` (a power of two above every intra bit),
+/// so the full tiled offset is `col_block[x] + row_block[y] + (col_intra[x] ^ row_intra[y])`.
+/// This replaces the 16-mask popcount loop per texel with two table loads.
+#[derive(Debug, Clone)]
+pub struct SwizzleLut {
+    col_block: Vec<usize>,
+    col_intra: Vec<usize>,
+    row_block: Vec<usize>,
+    row_intra: Vec<usize>,
+    pub tiled_len: usize,
+}
+
+impl SwizzleLut {
+    pub fn new(eq: &SwizzleEquation, bpe: usize, width_elems: u32, height_elems: u32) -> Option<Self> {
+        if bpe == 0 || eq.block_bytes < bpe || !eq.block_bytes.is_power_of_two() {
+            return None;
+        }
+        let elems_per_block = eq.block_bytes / bpe;
+        let lb = elems_per_block.ilog2();
+        let bw = 1u32 << lb.div_ceil(2);
+        let bh = ((elems_per_block as u32) / bw).max(1);
+        let blocks_x = width_elems.div_ceil(bw) as usize;
+        let blocks_y = height_elems.div_ceil(bh) as usize;
+        let intra = |x: u32, y: u32| -> usize {
+            let mut v = 0usize;
+            for (bit, &(mx, my)) in eq.bit_masks.iter().enumerate() {
+                let p = ((x & mx).count_ones() ^ (y & my).count_ones()) & 1;
+                v |= (p as usize) << bit;
+            }
+            v
+        };
+        let col_block = (0..width_elems).map(|x| (x / bw) as usize * eq.block_bytes).collect();
+        let col_intra = (0..width_elems).map(|x| intra(x, 0)).collect();
+        let row_block = (0..height_elems)
+            .map(|y| (y / bh) as usize * blocks_x * eq.block_bytes)
+            .collect();
+        let row_intra = (0..height_elems).map(|y| intra(0, y)).collect();
+        Some(Self {
+            col_block,
+            col_intra,
+            row_block,
+            row_intra,
+            tiled_len: blocks_x.checked_mul(blocks_y)?.checked_mul(eq.block_bytes)?,
+        })
+    }
+
+    #[inline(always)]
+    pub fn offset(&self, x: usize, y: usize) -> usize {
+        self.row_block[y] + self.col_block[x] + (self.row_intra[y] ^ self.col_intra[x])
+    }
+}
+
 /// Swizzle a linear 2D surface (`width_elems x height_elems`, `bpe` bytes per element) into tiled bytes.
 pub fn swizzle_2d(
     linear: &[u8],
@@ -348,22 +404,17 @@ pub fn swizzle_2d(
     if linear.len() < total_elems.checked_mul(bpe)? {
         return None;
     }
-    let elems_per_block = eq.block_bytes / bpe;
-    let lb = elems_per_block.ilog2();
-    let bw = 1u32 << lb.div_ceil(2);
-    let bh = (elems_per_block as u32) / bw;
-    let blocks_x = width_elems.div_ceil(bw) as usize;
-    let blocks_y = height_elems.div_ceil(bh) as usize;
-    let mut tiled = vec![0u8; blocks_x * blocks_y * eq.block_bytes];
-
-    for y in 0..height_elems {
-        for x in 0..width_elems {
-            let src_off = ((y as usize) * (width_elems as usize) + (x as usize)) * bpe;
-            let dst_off = eq.element_byte_offset(x, y, bpe, width_elems);
-            if dst_off + bpe > tiled.len() {
-                return None;
-            }
-            tiled[dst_off..dst_off + bpe].copy_from_slice(&linear[src_off..src_off + bpe]);
+    let lut = SwizzleLut::new(eq, bpe, width_elems, height_elems)?;
+    let mut tiled = vec![0u8; lut.tiled_len];
+    if total_elems == 0 {
+        return Some(tiled);
+    }
+    let w = width_elems as usize;
+    for (y, src_row) in linear[..total_elems * bpe].chunks_exact(w * bpe).enumerate() {
+        let (rb, ri) = (lut.row_block[y], lut.row_intra[y]);
+        for (x, src) in src_row.chunks_exact(bpe).enumerate() {
+            let dst_off = rb + lut.col_block[x] + (ri ^ lut.col_intra[x]);
+            tiled.get_mut(dst_off..dst_off + bpe)?.copy_from_slice(src);
         }
     }
     Some(tiled)
@@ -379,15 +430,16 @@ pub fn detile_2d(
 ) -> Option<Vec<u8>> {
     let total_elems = (width_elems as usize).checked_mul(height_elems as usize)?;
     let mut linear = vec![0u8; total_elems.checked_mul(bpe)?];
-
-    for y in 0..height_elems {
-        for x in 0..width_elems {
-            let src_off = eq.element_byte_offset(x, y, bpe, width_elems);
-            if src_off + bpe > tiled.len() {
-                return None;
-            }
-            let dst_off = ((y as usize) * (width_elems as usize) + (x as usize)) * bpe;
-            linear[dst_off..dst_off + bpe].copy_from_slice(&tiled[src_off..src_off + bpe]);
+    if total_elems == 0 {
+        return Some(linear);
+    }
+    let lut = SwizzleLut::new(eq, bpe, width_elems, height_elems)?;
+    let w = width_elems as usize;
+    for (y, dst_row) in linear.chunks_exact_mut(w * bpe).enumerate() {
+        let (rb, ri) = (lut.row_block[y], lut.row_intra[y]);
+        for (x, dst) in dst_row.chunks_exact_mut(bpe).enumerate() {
+            let src_off = rb + lut.col_block[x] + (ri ^ lut.col_intra[x]);
+            dst.copy_from_slice(tiled.get(src_off..src_off + bpe)?);
         }
     }
     Some(linear)
@@ -418,6 +470,38 @@ mod tests {
         // 64 + 16 + 4 + 1 standard tiles + 1 packed tile = 86 tiles
         assert_eq!(tiling.total_tiles, 86);
         assert_eq!(tiling.subresources[4].start_tile_index, PACKED_TILE);
+    }
+
+    #[test]
+    fn swizzle_lut_matches_per_bit_equation() {
+        for bpe in [1usize, 2, 4, 8, 16] {
+            for eq in [
+                SwizzleEquation::standard_64kb_s(bpe).unwrap(),
+                SwizzleEquation::rdna2_64kb_rx(bpe).unwrap(),
+            ] {
+                let (w, h) = (300u32, 270u32);
+                let lut = SwizzleLut::new(&eq, bpe, w, h).unwrap();
+                for y in (0..h).step_by(7) {
+                    for x in (0..w).step_by(5) {
+                        assert_eq!(
+                            lut.offset(x as usize, y as usize),
+                            eq.element_byte_offset(x, y, bpe, w),
+                            "bpe={bpe} x={x} y={y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn swizzle_handles_empty_and_non_aligned_surfaces() {
+        let eq = SwizzleEquation::rdna2_64kb_rx(4).unwrap();
+        assert!(swizzle_2d(&[], &eq, 4, 0, 0).is_some());
+        let (w, h) = (131u32, 67u32);
+        let linear: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 7 % 251) as u8).collect();
+        let tiled = swizzle_2d(&linear, &eq, 4, w, h).unwrap();
+        assert_eq!(detile_2d(&tiled, &eq, 4, w, h).unwrap(), linear);
     }
 
     #[test]
