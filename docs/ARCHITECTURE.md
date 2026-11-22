@@ -67,15 +67,18 @@ By targeting **Windows x86_64 with native Direct3D 12**, `xsxemu` achieves near-
 - [x] `d3d12_x` COM vtable objects, heap flag sanitization, `PresentX` translation, Windows `d3d12.dll` device bring-up, and software D3D12 rasterizer (`xsx-d3d12`)
 - [x] Clean-room x86_64 PE32+ test title generator (`xsx-testgen`) and end-to-end integration tests
 
-### Phase 2 — Real PE32+ Runtime Completeness
-- [ ] Secondary DLL loading & dependency graph resolution (guest-bundled DLLs alongside HLE modules)
-- [ ] PE TLS Directory (`IMAGE_DIRECTORY_ENTRY_TLS`) & TLS callback invocation
-- [ ] Windows x64 SEH / `.pdata` runtime function table registration (`RtlAddFunctionTable`)
-- [ ] Expanded `kernelx.dll` / `ntdll` / CRT file I/O (`CreateFileW`, `ReadFile`, virtual Xbox `G:\` / `T:\` drive mapping), threading (`CreateThread`, `SRWLOCK`, `CONDITION_VARIABLE`), and virtual memory reservation semantics
+### Phase 2 — Real PE32+ Runtime Completeness & Default FSR Integration (Complete)
+- [x] PE Export Table parsing & recursive secondary guest DLL loading (`LoadedModuleSet`, `DllMain` lifecycle, `GetModuleHandleA`/`LoadLibraryA`/`GetProcAddress`)
+- [x] PE TLS Directory (`IMAGE_DIRECTORY_ENTRY_TLS`) & automatic `PIMAGE_TLS_CALLBACK` execution (`DLL_PROCESS_ATTACH`/`DLL_PROCESS_DETACH`)
+- [x] Windows x64 SEH / `.pdata` runtime function table parsing & OS registration (`RtlAddFunctionTable` / `RtlDeleteFunctionTable` on Windows)
+- [x] Virtual Xbox drive filesystem (`G:\`, `T:\`, `D:\`, `S:\` with path-traversal containment) and `kernelx.dll` File I/O (`CreateFileA/W`, `ReadFile`, `WriteFile`, `SetFilePointerEx`, `GetFileSizeEx`, `GetFileAttributesA/W`)
+- [x] Real OS multithreading & synchronization (`CreateThread`, `WaitForSingleObject`, `GetExitCodeThread`, `SRWLOCK`, `CRITICAL_SECTION`, `Heap*`, `Tls*`)
+- [x] First-class default-enabled **AMD FSR** pipeline in `xsx-d3d12` (12-tap EASU + 5-tap RCAS, quality presets, Halton(2, 3) temporal jitter sequence, and SM 6.0 HLSL compute shaders ready for Phase 3 hardware dispatch)
 
-### Phase 3 — Native Windows Direct3D 12 Full Hardware Pipeline
+### Phase 3 — Native Windows Direct3D 12 Full Hardware Pipeline & GPU FSR Compute Dispatch
 - [ ] Win32 window + `IDXGIFactory4` + `IDXGISwapChain3` presentation bound to `PresentX`
 - [ ] Real host `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList`, `ID3D12DescriptorHeap`, `ID3D12RootSignature`, and `ID3D12PipelineState` forwarding
+- [ ] Native GPU D3D12 compute dispatch for FSR EASU + RCAS (`FSR_EASU_HLSL` / `FSR_RCAS_HLSL`) and FSR 2/3 temporal motion-vector & depth-buffer pass hooks
 - [ ] Xbox UMA `D3D12_HEAP_TYPE_CUSTOM` / CPU-cached upload staging rings for discrete PC GPUs
 - [ ] Shader container inspection (`DXBC` / `DXIL` pass-through & Xbox-specific root signature / shader metadata stripping)
 - [ ] Hardware fence & frame-pacing synchronization (`WaitFrameEventX` <-> DXGI waitable swapchain object)

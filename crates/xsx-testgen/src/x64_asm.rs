@@ -157,6 +157,18 @@ impl X64Assembler {
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
+    /// `cmp edx, imm32`
+    pub fn cmp_edx_imm32(&mut self, imm: u32) {
+        self.code.extend_from_slice(&[0x81, 0xFA]);
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
+    /// `mov eax, dword ptr [rip + disp32]`
+    pub fn mov_eax_from_rva32(&mut self, target_rva: u32) {
+        self.code.extend_from_slice(&[0x8B, 0x05]);
+        self.emit_rip_disp32(target_rva);
+    }
+
     /// `test eax, eax`
     pub fn test_eax_eax(&mut self) {
         self.code.extend_from_slice(&[0x85, 0xC0]);
@@ -171,6 +183,18 @@ impl X64Assembler {
     /// Emit `jne rel32` returning the patch site offset for `patch_branch_here`.
     pub fn jne_placeholder(&mut self) -> usize {
         self.code.extend_from_slice(&[0x0F, 0x85, 0, 0, 0, 0]);
+        self.code.len() - 4
+    }
+
+    /// Emit `je rel32` returning the patch site offset for `patch_branch_here`.
+    pub fn je_placeholder(&mut self) -> usize {
+        self.code.extend_from_slice(&[0x0F, 0x84, 0, 0, 0, 0]);
+        self.code.len() - 4
+    }
+
+    /// Emit `jmp rel32` returning the patch site offset for `patch_branch_here`.
+    pub fn jmp_placeholder(&mut self) -> usize {
+        self.code.extend_from_slice(&[0xE9, 0, 0, 0, 0]);
         self.code.len() - 4
     }
 

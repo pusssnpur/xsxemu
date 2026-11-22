@@ -9,7 +9,9 @@ pub mod d3d12_x;
 pub mod kernelx;
 pub mod registry;
 pub mod runtime;
+pub mod vfs;
 pub mod xgameruntime;
 
 pub use registry::ModuleRegistry;
 pub use runtime::{GuestRuntime, RuntimeGuard};
+pub use vfs::VirtualFs;
