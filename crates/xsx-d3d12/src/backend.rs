@@ -12,6 +12,7 @@ use xsx_abi::d3d12::{
     D3D12VertexBufferView, D3D12Viewport,
 };
 
+use crate::fsr::{self, FsrConfig, FsrFrameStats};
 use crate::native_win;
 use crate::software::SoftwareD3D12Backend;
 use crate::translate::{translate_heap_properties, HostDeviceCreateConfig};
@@ -32,6 +33,8 @@ pub struct TranslatorConfig {
     pub trace_calls: bool,
     pub default_width: u32,
     pub default_height: u32,
+    /// AMD FSR upscaling & RCAS sharpening pipeline (enabled by default at Quality 1.5x).
+    pub fsr: FsrConfig,
 }
 
 impl Default for TranslatorConfig {
@@ -41,6 +44,7 @@ impl Default for TranslatorConfig {
             trace_calls: false,
             default_width: 640,
             default_height: 360,
+            fsr: FsrConfig::default(),
         }
     }
 }
@@ -196,6 +200,7 @@ pub struct D3D12Translator {
     next_rtv_handle: AtomicU64,
     fences: Mutex<HashMap<u64, u64>>,
     presented_frames: Mutex<Vec<PresentedFrame>>,
+    fsr_stats: Mutex<Vec<FsrFrameStats>>,
     trace_log: Mutex<Vec<String>>,
     backend_name: &'static str,
 }
@@ -250,6 +255,7 @@ impl D3D12Translator {
             next_rtv_handle: AtomicU64::new(0x1000_0000),
             fences: Mutex::new(HashMap::new()),
             presented_frames: Mutex::new(Vec::new()),
+            fsr_stats: Mutex::new(Vec::new()),
             trace_log: Mutex::new(Vec::new()),
             backend_name,
         }))
@@ -257,6 +263,14 @@ impl D3D12Translator {
 
     pub fn backend_name(&self) -> &'static str {
         self.backend_name
+    }
+
+    pub fn fsr_config(&self) -> &FsrConfig {
+        &self.config.fsr
+    }
+
+    pub fn fsr_stats(&self) -> Vec<FsrFrameStats> {
+        self.fsr_stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     pub fn alloc_id(&self) -> u64 {
@@ -380,13 +394,29 @@ impl D3D12Translator {
             "CommandQueue::PresentX(resource={resource_id:?}, token={frame_token}, sync={sync_interval})"
         ));
         let frame_idx = self.presented_frames.lock().unwrap().len() as u64;
-        if let Some(frame) =
+        if let Some(raw_frame) =
             self.backend
                 .lock()
                 .unwrap()
                 .present_resource(resource_id, frame_idx, sync_interval)?
         {
-            self.presented_frames.lock().unwrap().push(frame);
+            let (final_frame, stats) = fsr::process_frame(&raw_frame, &self.config.fsr);
+            if self.config.fsr.is_active() {
+                self.record_trace(format!(
+                    "FSR({}): {}x{} -> {}x{} (easu={}, rcas={}, sharpness={:.2}, {}us)",
+                    stats.mode.name(),
+                    stats.input_width,
+                    stats.input_height,
+                    stats.output_width,
+                    stats.output_height,
+                    stats.easu_ran,
+                    stats.rcas_ran,
+                    stats.sharpness,
+                    stats.duration_us
+                ));
+            }
+            self.fsr_stats.lock().unwrap().push(stats);
+            self.presented_frames.lock().unwrap().push(final_frame);
         }
         Ok(())
     }

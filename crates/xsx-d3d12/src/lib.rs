@@ -8,6 +8,7 @@
 
 pub mod backend;
 pub mod com_objects;
+pub mod fsr;
 pub mod native_win;
 pub mod software;
 pub mod translate;
@@ -17,4 +18,5 @@ pub use backend::{
     TranslatorConfig,
 };
 pub use com_objects::create_device_x_com;
+pub use fsr::{FsrConfig, FsrDispatchConstants, FsrFrameStats, FsrQualityMode};
 pub use software::SoftwareD3D12Backend;
