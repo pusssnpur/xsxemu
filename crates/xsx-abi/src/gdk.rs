@@ -102,3 +102,164 @@ pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const WAIT_OBJECT_0: u32 = 0x0000_0000;
 pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+pub const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// `DllMain` / `PIMAGE_TLS_CALLBACK` reason codes.
+pub const DLL_PROCESS_DETACH: u32 = 0;
+pub const DLL_PROCESS_ATTACH: u32 = 1;
+pub const DLL_THREAD_ATTACH: u32 = 2;
+pub const DLL_THREAD_DETACH: u32 = 3;
+
+/// File I/O access & creation disposition flags.
+pub const GENERIC_READ: u32 = 0x8000_0000;
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+
+pub const CREATE_NEW: u32 = 1;
+pub const CREATE_ALWAYS: u32 = 2;
+pub const OPEN_EXISTING: u32 = 3;
+pub const OPEN_ALWAYS: u32 = 4;
+pub const TRUNCATE_EXISTING: u32 = 5;
+
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+
+pub const FILE_BEGIN: u32 = 0;
+pub const FILE_CURRENT: u32 = 1;
+pub const FILE_END: u32 = 2;
+
+/// Win32 `SRWLOCK` (pointer-sized opaque lock slot).
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct SrwLock {
+    pub ptr: usize,
+}
+
+/// Win32 `CRITICAL_SECTION` (40 bytes on Win64).
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct CriticalSection {
+    pub debug_info: usize,
+    pub lock_count: i32,
+    pub recursion_count: i32,
+    pub owning_thread: usize,
+    pub lock_semaphore: usize,
+    pub spin_count: usize,
+}
+
+/// Windows x64 `.pdata` `IMAGE_RUNTIME_FUNCTION_ENTRY` (12 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuntimeFunction {
+    pub begin_address: u32,
+    pub end_address: u32,
+    pub unwind_info_address: u32,
+}
+
+/// Win64 `PIMAGE_TLS_CALLBACK` signature.
+pub type TlsCallbackFn =
+    unsafe extern "win64" fn(dll_handle: *mut c_void, reason: u32, reserved: *mut c_void);
+
+/// Win64 `DllMain` signature.
+pub type DllMainFn =
+    unsafe extern "win64" fn(hinst_dll: *mut c_void, fdw_reason: u32, lpv_reserved: *mut c_void) -> i32;
+
+/// Win64 `LPTHREAD_START_ROUTINE` signature.
+pub type ThreadStartRoutine = unsafe extern "win64" fn(lp_thread_parameter: *mut c_void) -> u32;
+
+/// Win32 `SYSTEMTIME` (16 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SystemTime {
+    pub w_year: u16,
+    pub w_month: u16,
+    pub w_day_of_week: u16,
+    pub w_day: u16,
+    pub w_hour: u16,
+    pub w_minute: u16,
+    pub w_second: u16,
+    pub w_milliseconds: u16,
+}
+
+/// Win32 `FILETIME` (8 bytes — 100-nanosecond intervals since 1601-01-01 00:00:00 UTC).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileTime {
+    pub dw_low_date_time: u32,
+    pub dw_high_date_time: u32,
+}
+
+impl FileTime {
+    pub const fn from_u64(ticks: u64) -> Self {
+        Self {
+            dw_low_date_time: ticks as u32,
+            dw_high_date_time: (ticks >> 32) as u32,
+        }
+    }
+
+    pub const fn to_u64(self) -> u64 {
+        (self.dw_low_date_time as u64) | ((self.dw_high_date_time as u64) << 32)
+    }
+}
+
+/// Win32 `TIME_ZONE_INFORMATION` (172 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TimeZoneInformation {
+    pub bias: i32,
+    pub standard_name: [u16; 32],
+    pub standard_date: SystemTime,
+    pub standard_bias: i32,
+    pub daylight_name: [u16; 32],
+    pub daylight_date: SystemTime,
+    pub daylight_bias: i32,
+}
+
+impl Default for TimeZoneInformation {
+    fn default() -> Self {
+        Self {
+            bias: 0,
+            standard_name: [0; 32],
+            standard_date: SystemTime::default(),
+            standard_bias: 0,
+            daylight_name: [0; 32],
+            daylight_date: SystemTime::default(),
+            daylight_bias: 0,
+        }
+    }
+}
+
+/// Win64 `SYSTEM_INFO` (48 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemInfo {
+    pub w_processor_architecture: u16,
+    pub w_reserved: u16,
+    pub dw_page_size: u32,
+    pub lp_minimum_application_address: usize,
+    pub lp_maximum_application_address: usize,
+    pub dw_active_processor_mask: usize,
+    pub dw_number_of_processors: u32,
+    pub dw_processor_type: u32,
+    pub dw_allocation_granularity: u32,
+    pub w_processor_level: u16,
+    pub w_processor_revision: u16,
+}
+
+pub const PROCESSOR_ARCHITECTURE_AMD64: u16 = 9;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn win64_sync_and_pdata_sizes() {
+        assert_eq!(core::mem::size_of::<SrwLock>(), 8);
+        assert_eq!(core::mem::size_of::<CriticalSection>(), 40);
+        assert_eq!(core::mem::size_of::<RuntimeFunction>(), 12);
+        assert_eq!(core::mem::size_of::<SystemTime>(), 16);
+        assert_eq!(core::mem::size_of::<FileTime>(), 8);
+        assert_eq!(core::mem::size_of::<TimeZoneInformation>(), 172);
+        assert_eq!(core::mem::size_of::<SystemInfo>(), 48);
+    }
+}
