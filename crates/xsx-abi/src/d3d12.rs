@@ -251,6 +251,74 @@ pub struct D3D12XboxPresentPlaneParameters {
     pub options: u32,
 }
 
+/// Shader bytecode blob reference (`D3D12_SHADER_BYTECODE`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12ShaderBytecode {
+    pub p_shader_bytecode: *const c_void,
+    pub byte_code_length: usize,
+}
+
+impl Default for D3D12ShaderBytecode {
+    fn default() -> Self {
+        Self {
+            p_shader_bytecode: core::ptr::null(),
+            byte_code_length: 0,
+        }
+    }
+}
+
+/// Clean-room graphics PSO descriptor subset for Xbox `d3d12_x` translation.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12GraphicsPipelineStateDesc {
+    pub p_root_signature: *mut c_void,
+    pub vs: D3D12ShaderBytecode,
+    pub ps: D3D12ShaderBytecode,
+    pub num_render_targets: u32,
+    pub rtv_formats: [u32; 8],
+    pub dsv_format: u32,
+    pub sample_desc: DxgiSampleDesc,
+    pub flags: u32,
+}
+
+/// Clean-room compute PSO descriptor (`D3D12_COMPUTE_PIPELINE_STATE_DESC`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct D3D12ComputePipelineStateDesc {
+    pub p_root_signature: *mut c_void,
+    pub cs: D3D12ShaderBytecode,
+    pub node_mask: u32,
+    pub flags: u32,
+}
+
+/// Exact Windows `DXGI_SWAP_CHAIN_DESC1` (48 bytes) for `IDXGIFactory4::CreateSwapChainForHwnd`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DxgiSwapChainDesc1 {
+    pub width: u32,
+    pub height: u32,
+    pub format: u32,
+    pub stereo: i32,
+    pub sample_desc: DxgiSampleDesc,
+    pub buffer_usage: u32,
+    pub buffer_count: u32,
+    pub scaling: u32,
+    pub swap_effect: u32,
+    pub alpha_mode: u32,
+    pub flags: u32,
+}
+
+pub const DXGI_USAGE_RENDER_TARGET_OUTPUT: u32 = 0x0000_0020;
+pub const DXGI_SWAP_EFFECT_FLIP_DISCARD: u32 = 4;
+pub const DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT: u32 = 0x40;
+
+pub const D3D12_RESOURCE_STATE_UNORDERED_ACCESS: u32 = 0x8;
+pub const D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+pub const D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE: u32 = 0x80;
+pub const D3D12_RESOURCE_STATE_COPY_DEST: u32 = 0x400;
+pub const D3D12_RESOURCE_STATE_COPY_SOURCE: u32 = 0x800;
+
 /// Vertex format used by our clean-room vertical-slice test pipeline:
 /// clip-space `(x, y, z)` + linear RGBA `(r, g, b, a)`.
 #[repr(C)]
@@ -264,8 +332,8 @@ pub struct SimpleVertex {
 // Clean-room Xbox `d3d12_x` COM VTable Layouts
 //
 // Each interface starts with `IUnknownVtbl` (slots 0..=2) followed by our
-// documented method table for the vertical slice. Every method uses
-// `extern "win64"` so guest PE64 binaries invoke them natively.
+// documented method table. Every method uses `extern "win64"` so guest PE64
+// binaries invoke them natively.
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -339,6 +407,39 @@ pub struct ID3D12DeviceXVtbl {
         p_reserved: *mut c_void,
         p_frame_token: *mut u64,
     ) -> HResult,
+    // Slot 12 (Phase 3: CreateRootSignature)
+    pub create_root_signature: unsafe extern "win64" fn(
+        this: *mut c_void,
+        node_mask: u32,
+        p_blob: *const c_void,
+        blob_len: usize,
+        riid: *const Guid,
+        pp_root_signature: *mut *mut c_void,
+    ) -> HResult,
+    // Slot 13 (Phase 3: CreateGraphicsPipelineState)
+    pub create_graphics_pipeline_state: unsafe extern "win64" fn(
+        this: *mut c_void,
+        p_desc: *const D3D12GraphicsPipelineStateDesc,
+        riid: *const Guid,
+        pp_pso: *mut *mut c_void,
+    ) -> HResult,
+    // Slot 14 (Phase 3: CreateComputePipelineState)
+    pub create_compute_pipeline_state: unsafe extern "win64" fn(
+        this: *mut c_void,
+        p_desc: *const D3D12ComputePipelineStateDesc,
+        riid: *const Guid,
+        pp_pso: *mut *mut c_void,
+    ) -> HResult,
+}
+
+#[repr(C)]
+pub struct ID3D12RootSignatureXVtbl {
+    pub base: IUnknownVtbl,
+}
+
+#[repr(C)]
+pub struct ID3D12PipelineStateXVtbl {
+    pub base: IUnknownVtbl,
 }
 
 #[repr(C)]
@@ -435,6 +536,28 @@ pub struct ID3D12GraphicsCommandListXVtbl {
         start_vertex_location: u32,
         start_instance_location: u32,
     ),
+    // Slot 13 (Phase 3: SetPipelineState)
+    pub set_pipeline_state:
+        unsafe extern "win64" fn(this: *mut c_void, p_pipeline_state: *mut c_void),
+    // Slot 14 (Phase 3: SetGraphicsRootSignature)
+    pub set_graphics_root_signature:
+        unsafe extern "win64" fn(this: *mut c_void, p_root_signature: *mut c_void),
+    // Slot 15 (Phase 3: SetComputeRootSignature)
+    pub set_compute_root_signature:
+        unsafe extern "win64" fn(this: *mut c_void, p_root_signature: *mut c_void),
+    // Slot 16 (Phase 3: Dispatch compute thread groups)
+    pub dispatch: unsafe extern "win64" fn(
+        this: *mut c_void,
+        thread_group_count_x: u32,
+        thread_group_count_y: u32,
+        thread_group_count_z: u32,
+    ),
+    // Slot 17 (Phase 3: CopyResource)
+    pub copy_resource: unsafe extern "win64" fn(
+        this: *mut c_void,
+        p_dst_resource: *mut c_void,
+        p_src_resource: *mut c_void,
+    ),
 }
 
 #[repr(C)]
@@ -494,5 +617,7 @@ mod tests {
         assert_eq!(size_of::<D3D12VertexBufferView>(), 16);
         assert_eq!(size_of::<D3D12CpuDescriptorHandle>(), 8);
         assert_eq!(size_of::<SimpleVertex>(), 28);
+        assert_eq!(size_of::<DxgiSwapChainDesc1>(), 48);
+        assert_eq!(size_of::<D3D12ShaderBytecode>(), 16);
     }
 }

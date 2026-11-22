@@ -27,18 +27,32 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design specificati
 cargo test --workspace
 ```
 
-### Generate, Inspect, and Execute the Vertical-Slice Sample
+### Generate, Inspect, and Execute the Samples
 
 ```bash
-# 1. Generate a synthetic Xbox Series X PE32+ test executable
+# Vertical-slice single-binary sample (FSR Quality 1.5x enabled by default -> 960x540)
 cargo run -p xsxemu -- gen-sample hello_xsx.exe
-
-# 2. Inspect PE32+ headers, sections, Xbox DLL imports, and base relocations
 cargo run -p xsxemu -- inspect hello_xsx.exe
-
-# 3. Execute natively with call tracing and dump the PresentX framebuffer
 cargo run -p xsxemu -- run hello_xsx.exe --trace --force-relocate --dump-frame frame.bmp
+
+# Phase 2 multi-module suite (secondary guest DLL, TLS callbacks, .pdata, Xbox T:\ VFS, threads, FSR)
+cargo run -p xsxemu -- gen-phase2 ./phase2_out
+cargo run -p xsxemu -- inspect ./phase2_out/xsx_helper.dll
+cargo run -p xsxemu -- inspect ./phase2_out/phase2_xsx.exe
+cargo run -p xsxemu -- run ./phase2_out/phase2_xsx.exe --trace --force-relocate --dump-frame fsr_frame.bmp
+
+# Phase 3 + Phase 4 full-stack suite (DXBC shader stripping, PSO/Dispatch, DirectStorage, XInput, XAudio2, XUser, XGameSave, FSR)
+cargo run -p xsxemu -- gen-fullstack ./fullstack_out
+cargo run -p xsxemu -- run ./fullstack_out/full_stack_xsx.exe --trace --force-relocate --dump-frame fullstack_fsr.bmp
 ```
+
+### AMD FSR Upscaling (Enabled by Default)
+
+`xsxemu` incorporates **AMD FidelityFX Super Resolution (FSR)** — **EASU** (12-tap edge-adaptive spatial upsampling) + **RCAS** (5-tap contrast-adaptive sharpening) — directly into the `PresentX` presentation pipeline **by default** (`--fsr quality`, 1.5x scale, sharpness `0.8`):
+
+- `--fsr <ultra-quality|quality|balanced|performance|ultra-performance|native-aa|off>`
+- `--fsr-sharpness <0.0..=1.0>` (default `0.8`)
+- `--output-res <WxH>` (e.g. `1920x1080`, `3840x2160`)
 
 ### Selecting a GPU Backend
 

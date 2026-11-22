@@ -1,11 +1,22 @@
 //! Spec-compliant PE32+ (AMD64) parser for Xbox Series X|S & Windows x64 binaries.
+//!
+//! Supports:
+//! - DOS, COFF, and PE32+ Optional Headers + Section Headers
+//! - Import Directory Table (ILT/IAT, named & ordinal imports)
+//! - Export Directory Table (named, ordinal, and forwarder exports)
+//! - Base Relocation Table (`DIR64`, `HIGHLOW`, `ABSOLUTE`)
+//! - TLS Directory (`IMAGE_TLS_DIRECTORY64`)
+//! - Exception Directory (`.pdata` `RUNTIME_FUNCTION` entries)
 
 use std::fmt;
+
+use xsx_abi::gdk::RuntimeFunction;
 
 pub const DOS_SIGNATURE: u16 = 0x5A4D; // "MZ"
 pub const PE_SIGNATURE: u32 = 0x0000_4550; // "PE\0\0"
 pub const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 pub const PE32_PLUS_MAGIC: u16 = 0x020B;
+pub const IMAGE_FILE_DLL: u16 = 0x2000;
 
 pub const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
 pub const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
@@ -98,6 +109,32 @@ pub struct ImportDescriptor {
     pub entries: Vec<ImportEntry>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExportEntry {
+    pub ordinal: u16,
+    pub name: Option<String>,
+    pub rva: u32,
+    pub forwarder: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExportDirectory {
+    pub dll_name: String,
+    pub ordinal_base: u32,
+    pub entries: Vec<ExportEntry>,
+}
+
+/// Parsed `IMAGE_TLS_DIRECTORY64` (40 bytes).
+#[derive(Debug, Clone, Copy)]
+pub struct TlsDirectory {
+    pub start_address_of_raw_data: u64,
+    pub end_address_of_raw_data: u64,
+    pub address_of_index: u64,
+    pub address_of_callbacks: u64,
+    pub size_of_zero_fill: u32,
+    pub characteristics: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RelocEntry {
     pub kind: u16,
@@ -125,7 +162,10 @@ pub struct PeImage {
     pub data_directories: Vec<DataDirectory>,
     pub sections: Vec<SectionHeader>,
     pub imports: Vec<ImportDescriptor>,
+    pub exports: Option<ExportDirectory>,
     pub relocations: Vec<RelocBlock>,
+    pub tls: Option<TlsDirectory>,
+    pub runtime_functions: Vec<RuntimeFunction>,
     pub raw_bytes: Vec<u8>,
 }
 
@@ -221,13 +261,23 @@ impl PeImage {
             data_directories,
             sections,
             imports: Vec::new(),
+            exports: None,
             relocations: Vec::new(),
+            tls: None,
+            runtime_functions: Vec::new(),
             raw_bytes: bytes.to_vec(),
         };
 
         image.imports = image.parse_imports()?;
+        image.exports = image.parse_exports()?;
         image.relocations = image.parse_relocations()?;
+        image.tls = image.parse_tls()?;
+        image.runtime_functions = image.parse_exception_dir()?;
         Ok(image)
+    }
+
+    pub fn is_dll(&self) -> bool {
+        (self.characteristics & IMAGE_FILE_DLL) != 0
     }
 
     pub fn data_directory(&self, idx: usize) -> Option<DataDirectory> {
@@ -350,6 +400,72 @@ impl PeImage {
         Ok(out)
     }
 
+    fn parse_exports(&self) -> Result<Option<ExportDirectory>, PeError> {
+        let Some(dir) = self.data_directory(IMAGE_DIRECTORY_ENTRY_EXPORT) else {
+            return Ok(None);
+        };
+        let off = self.rva_to_file_offset(dir.virtual_address)?;
+        if off + 40 > self.raw_bytes.len() {
+            return Err(PeError::Truncated("ExportDirectory"));
+        }
+        let name_rva = read_u32(&self.raw_bytes, off + 12, "Export.Name")?;
+        let ordinal_base = read_u32(&self.raw_bytes, off + 16, "Export.Base")?;
+        let num_functions = read_u32(&self.raw_bytes, off + 20, "Export.NumberOfFunctions")? as usize;
+        let num_names = read_u32(&self.raw_bytes, off + 24, "Export.NumberOfNames")? as usize;
+        let addr_funcs_rva = read_u32(&self.raw_bytes, off + 28, "Export.AddressOfFunctions")?;
+        let addr_names_rva = read_u32(&self.raw_bytes, off + 32, "Export.AddressOfNames")?;
+        let addr_ords_rva = read_u32(&self.raw_bytes, off + 36, "Export.AddressOfNameOrdinals")?;
+
+        let dll_name = if name_rva != 0 {
+            self.read_cstr_at_rva(name_rva)?
+        } else {
+            String::new()
+        };
+
+        // Map function-table index -> export name
+        let mut names_by_idx: Vec<Option<String>> = vec![None; num_functions];
+        if num_names > 0 && addr_names_rva != 0 && addr_ords_rva != 0 {
+            let names_off = self.rva_to_file_offset(addr_names_rva)?;
+            let ords_off = self.rva_to_file_offset(addr_ords_rva)?;
+            for i in 0..num_names {
+                let fn_name_rva = read_u32(&self.raw_bytes, names_off + i * 4, "ExportNameRva")?;
+                let ord_idx = read_u16(&self.raw_bytes, ords_off + i * 2, "ExportOrdinal")? as usize;
+                if ord_idx < num_functions {
+                    names_by_idx[ord_idx] = Some(self.read_cstr_at_rva(fn_name_rva)?);
+                }
+            }
+        }
+
+        let funcs_off = self.rva_to_file_offset(addr_funcs_rva)?;
+        let dir_start = dir.virtual_address;
+        let dir_end = dir.virtual_address.saturating_add(dir.size);
+        let mut entries = Vec::with_capacity(num_functions);
+
+        for idx in 0..num_functions {
+            let fn_rva = read_u32(&self.raw_bytes, funcs_off + idx * 4, "ExportFunctionRva")?;
+            if fn_rva == 0 {
+                continue;
+            }
+            let forwarder = if fn_rva >= dir_start && fn_rva < dir_end {
+                Some(self.read_cstr_at_rva(fn_rva)?)
+            } else {
+                None
+            };
+            entries.push(ExportEntry {
+                ordinal: (ordinal_base + idx as u32) as u16,
+                name: names_by_idx[idx].take(),
+                rva: fn_rva,
+                forwarder,
+            });
+        }
+
+        Ok(Some(ExportDirectory {
+            dll_name,
+            ordinal_base,
+            entries,
+        }))
+    }
+
     fn parse_relocations(&self) -> Result<Vec<RelocBlock>, PeError> {
         let Some(dir) = self.data_directory(IMAGE_DIRECTORY_ENTRY_BASERELOC) else {
             return Ok(Vec::new());
@@ -380,26 +496,65 @@ impl PeImage {
 
         Ok(blocks)
     }
+
+    fn parse_tls(&self) -> Result<Option<TlsDirectory>, PeError> {
+        let Some(dir) = self.data_directory(IMAGE_DIRECTORY_ENTRY_TLS) else {
+            return Ok(None);
+        };
+        let off = self.rva_to_file_offset(dir.virtual_address)?;
+        if off + 40 > self.raw_bytes.len() {
+            return Err(PeError::Truncated("IMAGE_TLS_DIRECTORY64"));
+        }
+        Ok(Some(TlsDirectory {
+            start_address_of_raw_data: read_u64(&self.raw_bytes, off, "Tls.StartRaw")?,
+            end_address_of_raw_data: read_u64(&self.raw_bytes, off + 8, "Tls.EndRaw")?,
+            address_of_index: read_u64(&self.raw_bytes, off + 16, "Tls.Index")?,
+            address_of_callbacks: read_u64(&self.raw_bytes, off + 24, "Tls.Callbacks")?,
+            size_of_zero_fill: read_u32(&self.raw_bytes, off + 32, "Tls.ZeroFill")?,
+            characteristics: read_u32(&self.raw_bytes, off + 36, "Tls.Characteristics")?,
+        }))
+    }
+
+    fn parse_exception_dir(&self) -> Result<Vec<RuntimeFunction>, PeError> {
+        let Some(dir) = self.data_directory(IMAGE_DIRECTORY_ENTRY_EXCEPTION) else {
+            return Ok(Vec::new());
+        };
+        let start = self.rva_to_file_offset(dir.virtual_address)?;
+        let count = (dir.size as usize) / 12;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = start + i * 12;
+            if off + 12 > self.raw_bytes.len() {
+                break;
+            }
+            let begin = read_u32(&self.raw_bytes, off, "Pdata.BeginAddress")?;
+            let end = read_u32(&self.raw_bytes, off + 4, "Pdata.EndAddress")?;
+            let unwind = read_u32(&self.raw_bytes, off + 8, "Pdata.UnwindInfoAddress")?;
+            if begin == 0 && end == 0 && unwind == 0 {
+                continue;
+            }
+            out.push(RuntimeFunction {
+                begin_address: begin,
+                end_address: end,
+                unwind_info_address: unwind,
+            });
+        }
+        Ok(out)
+    }
 }
 
 fn read_u16(bytes: &[u8], off: usize, ctx: &'static str) -> Result<u16, PeError> {
-    let slice = bytes
-        .get(off..off + 2)
-        .ok_or(PeError::Truncated(ctx))?;
+    let slice = bytes.get(off..off + 2).ok_or(PeError::Truncated(ctx))?;
     Ok(u16::from_le_bytes([slice[0], slice[1]]))
 }
 
 fn read_u32(bytes: &[u8], off: usize, ctx: &'static str) -> Result<u32, PeError> {
-    let slice = bytes
-        .get(off..off + 4)
-        .ok_or(PeError::Truncated(ctx))?;
+    let slice = bytes.get(off..off + 4).ok_or(PeError::Truncated(ctx))?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
 fn read_u64(bytes: &[u8], off: usize, ctx: &'static str) -> Result<u64, PeError> {
-    let slice = bytes
-        .get(off..off + 8)
-        .ok_or(PeError::Truncated(ctx))?;
+    let slice = bytes.get(off..off + 8).ok_or(PeError::Truncated(ctx))?;
     Ok(u64::from_le_bytes([
         slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
     ]))

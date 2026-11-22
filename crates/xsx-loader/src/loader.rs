@@ -1,22 +1,37 @@
-//! PE32+ image mapper, relocator, IAT patcher, and native Win64 ABI executor.
+//! PE32+ image mapper, relocator, IAT patcher, TLS callback runner, `.pdata` SEH registrar,
+//! and native Win64 ABI executor.
 
+use core::ffi::c_void;
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use xsx_abi::gdk::{
+    DllMainFn, RuntimeFunction, TlsCallbackFn, DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH,
+};
 
 use crate::memory::{PageProtection, VirtualMemory};
 use crate::pe::{
-    ImportSymbol, PeError, PeImage, IMAGE_REL_BASED_ABSOLUTE, IMAGE_REL_BASED_DIR64,
-    IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE,
+    ImportSymbol, PeError, PeImage, IMAGE_DIRECTORY_ENTRY_TLS, IMAGE_REL_BASED_ABSOLUTE,
+    IMAGE_REL_BASED_DIR64, IMAGE_REL_BASED_HIGHLOW, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ,
+    IMAGE_SCN_MEM_WRITE,
 };
+
+static NEXT_TLS_INDEX: AtomicU32 = AtomicU32::new(1);
 
 #[derive(Debug)]
 pub enum LoaderError {
     Pe(PeError),
     Memory(io::Error),
+    Io { path: String, err: io::Error },
     UnresolvedImport { dll: String, symbol: ImportSymbol },
     SectionOutOfBounds { name: String, end: usize, image_size: usize },
     UnsupportedRelocation { kind: u16, rva: u32 },
     InvalidEntryPoint(u32),
+    DependencyCycle(String),
+    DllMainFailed(String),
 }
 
 impl fmt::Display for LoaderError {
@@ -24,6 +39,7 @@ impl fmt::Display for LoaderError {
         match self {
             LoaderError::Pe(e) => write!(f, "PE parse error: {e}"),
             LoaderError::Memory(e) => write!(f, "virtual memory error: {e}"),
+            LoaderError::Io { path, err } => write!(f, "I/O error reading '{path}': {err}"),
             LoaderError::UnresolvedImport { dll, symbol } => {
                 write!(f, "unresolved import: {dll}!{symbol}")
             }
@@ -36,6 +52,12 @@ impl fmt::Display for LoaderError {
             }
             LoaderError::InvalidEntryPoint(rva) => {
                 write!(f, "entry point RVA 0x{rva:08X} out of image bounds")
+            }
+            LoaderError::DependencyCycle(dll) => {
+                write!(f, "circular guest DLL dependency detected: {dll}")
+            }
+            LoaderError::DllMainFailed(dll) => {
+                write!(f, "guest DLL '{dll}' DllMain(DLL_PROCESS_ATTACH) returned FALSE")
             }
         }
     }
@@ -70,17 +92,25 @@ pub trait ImportResolver {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Option<(usize, bool)>;
 }
 
-/// A PE32+ image mapped into executable host virtual memory, relocated, and IAT-patched.
+/// A PE32+ image mapped into executable host virtual memory, relocated, IAT-patched,
+/// with parsed exports, TLS callbacks, and `.pdata` SEH unwind tables.
 pub struct LoadedImage {
     memory: VirtualMemory,
     preferred_base: u64,
     entry_point_rva: u32,
+    is_dll: bool,
     relocations_applied: usize,
     resolved_imports: Vec<ResolvedImport>,
+    exports_by_name: HashMap<String, usize>,
+    exports_by_ordinal: HashMap<u16, usize>,
+    tls_callbacks: Vec<usize>,
+    tls_attached: AtomicBool,
+    runtime_functions: Vec<RuntimeFunction>,
+    pdata_registered_ptr: Option<usize>,
 }
 
 impl LoadedImage {
-    /// Map, relocate, patch imports, and apply page protections for a parsed `PeImage`.
+    /// Map, relocate, patch imports, register `.pdata` (on Windows), and apply page protections.
     pub fn load(
         pe: &PeImage,
         resolver: &dyn ImportResolver,
@@ -95,7 +125,9 @@ impl LoadedImage {
         let mut memory = VirtualMemory::allocate(preferred_hint, image_size)?;
 
         // 1. Copy PE headers
-        let header_len = (pe.size_of_headers as usize).min(pe.raw_bytes.len()).min(image_size);
+        let header_len = (pe.size_of_headers as usize)
+            .min(pe.raw_bytes.len())
+            .min(image_size);
         memory.as_mut_slice()[..header_len].copy_from_slice(&pe.raw_bytes[..header_len]);
 
         // 2. Map every section
@@ -192,7 +224,25 @@ impl LoadedImage {
             }
         }
 
-        // 5. Apply per-section OS page protections
+        // 5. Read relocated TLS Directory (write TLS index + collect callback VAs)
+        let tls_callbacks = collect_tls_callbacks(pe, &mut memory);
+
+        // 6. Build runtime export lookup tables (for DLLs & self-exporting EXEs)
+        let mut exports_by_name = HashMap::new();
+        let mut exports_by_ordinal = HashMap::new();
+        if let Some(exp_dir) = &pe.exports {
+            for e in &exp_dir.entries {
+                if e.forwarder.is_none() {
+                    let va = memory.base_addr() + e.rva as usize;
+                    exports_by_ordinal.insert(e.ordinal, va);
+                    if let Some(name) = &e.name {
+                        exports_by_name.insert(name.clone(), va);
+                    }
+                }
+            }
+        }
+
+        // 7. Apply per-section OS page protections
         memory.protect(0, pe.size_of_headers as usize, PageProtection::Read)?;
         for sec in &pe.sections {
             let prot = section_protection(sec.characteristics);
@@ -200,7 +250,10 @@ impl LoadedImage {
             memory.protect(sec.virtual_address as usize, span, prot)?;
         }
 
-        if pe.entry_point_rva as usize >= memory.len() {
+        // 8. Register `.pdata` x64 SEH unwind table with Windows OS (no-op on Unix)
+        let pdata_registered_ptr = register_pdata_table(pe, &memory);
+
+        if pe.entry_point_rva != 0 && pe.entry_point_rva as usize >= memory.len() {
             return Err(LoaderError::InvalidEntryPoint(pe.entry_point_rva));
         }
 
@@ -208,8 +261,15 @@ impl LoadedImage {
             memory,
             preferred_base: pe.image_base,
             entry_point_rva: pe.entry_point_rva,
+            is_dll: pe.is_dll(),
             relocations_applied,
             resolved_imports,
+            exports_by_name,
+            exports_by_ordinal,
+            tls_callbacks,
+            tls_attached: AtomicBool::new(false),
+            runtime_functions: pe.runtime_functions.clone(),
+            pdata_registered_ptr,
         })
     }
 
@@ -217,8 +277,16 @@ impl LoadedImage {
         self.memory.base_addr()
     }
 
+    pub fn image_len(&self) -> usize {
+        self.memory.len()
+    }
+
     pub fn preferred_base(&self) -> u64 {
         self.preferred_base
+    }
+
+    pub fn is_dll(&self) -> bool {
+        self.is_dll
     }
 
     pub fn entry_point_va(&self) -> usize {
@@ -233,15 +301,182 @@ impl LoadedImage {
         &self.resolved_imports
     }
 
-    /// Execute the loaded guest PE32+ entry point natively using the Win64 calling convention.
+    pub fn tls_callbacks(&self) -> &[usize] {
+        &self.tls_callbacks
+    }
+
+    pub fn runtime_functions(&self) -> &[RuntimeFunction] {
+        &self.runtime_functions
+    }
+
+    pub fn is_pdata_registered(&self) -> bool {
+        self.pdata_registered_ptr.is_some()
+    }
+
+    /// Look up the `.pdata` `RuntimeFunction` covering a guest virtual address.
+    pub fn find_runtime_function(&self, va: usize) -> Option<RuntimeFunction> {
+        let base = self.base_addr();
+        if va < base || va >= base + self.memory.len() {
+            return None;
+        }
+        let rva = (va - base) as u32;
+        self.runtime_functions
+            .iter()
+            .copied()
+            .find(|rf| rva >= rf.begin_address && rva < rf.end_address)
+    }
+
+    /// Look up an exported function virtual address by name or ordinal.
+    pub fn resolve_export(&self, symbol: &ImportSymbol) -> Option<usize> {
+        match symbol {
+            ImportSymbol::Name { name, .. } => self.exports_by_name.get(name).copied(),
+            ImportSymbol::Ordinal(ord) => self.exports_by_ordinal.get(ord).copied(),
+        }
+    }
+
+    pub fn export_count(&self) -> usize {
+        self.exports_by_ordinal.len()
+    }
+
+    /// Invoke all PE TLS callbacks (`PIMAGE_TLS_CALLBACK`) with `reason`.
+    ///
+    /// # Safety
+    /// Executes mapped guest machine code callbacks in the current process.
+    pub unsafe fn run_tls_callbacks(&self, reason: u32) -> usize {
+        let handle = self.base_addr() as *mut c_void;
+        for &cb_va in &self.tls_callbacks {
+            let cb: TlsCallbackFn = std::mem::transmute(cb_va);
+            cb(handle, reason, ptr::null_mut());
+        }
+        if reason == DLL_PROCESS_ATTACH {
+            self.tls_attached.store(true, Ordering::SeqCst);
+        } else if reason == DLL_PROCESS_DETACH {
+            self.tls_attached.store(false, Ordering::SeqCst);
+        }
+        self.tls_callbacks.len()
+    }
+
+    /// Invoke `DllMain(hinstDLL, reason, NULL)` for a loaded guest DLL.
+    ///
+    /// # Safety
+    /// Executes mapped guest machine code in the current process.
+    pub unsafe fn run_dll_main(&self, reason: u32) -> bool {
+        if self.entry_point_rva == 0 {
+            return true;
+        }
+        let dll_main: DllMainFn = std::mem::transmute(self.entry_point_va());
+        dll_main(self.base_addr() as *mut c_void, reason, ptr::null_mut()) != 0
+    }
+
+    /// Execute the loaded guest PE32+ executable entry point natively via Win64 ABI.
+    /// Automatically invokes PE TLS callbacks (`DLL_PROCESS_ATTACH` before, `DLL_PROCESS_DETACH` after).
     ///
     /// # Safety
     /// Executes machine code mapped from the loaded PE image inside the current process.
     pub unsafe fn execute_entry(&self) -> u32 {
+        if !self.tls_callbacks.is_empty() && !self.tls_attached.load(Ordering::SeqCst) {
+            self.run_tls_callbacks(DLL_PROCESS_ATTACH);
+        }
         let entry: unsafe extern "win64" fn() -> u32 = std::mem::transmute(self.entry_point_va());
-        entry()
+        let rc = entry();
+        if !self.tls_callbacks.is_empty() && self.tls_attached.load(Ordering::SeqCst) {
+            self.run_tls_callbacks(DLL_PROCESS_DETACH);
+        }
+        rc
     }
 }
+
+impl Drop for LoadedImage {
+    fn drop(&mut self) {
+        if let Some(table_ptr) = self.pdata_registered_ptr.take() {
+            unregister_pdata_table(table_ptr);
+        }
+    }
+}
+
+fn collect_tls_callbacks(pe: &PeImage, memory: &mut VirtualMemory) -> Vec<usize> {
+    let Some(dir) = pe.data_directory(IMAGE_DIRECTORY_ENTRY_TLS) else {
+        return Vec::new();
+    };
+    let tls_off = dir.virtual_address as usize;
+    let base = memory.base_addr();
+    let img_end = base + memory.len();
+    let buf = memory.as_mut_slice();
+    if tls_off + 40 > buf.len() {
+        return Vec::new();
+    }
+
+    // Read relocated 64-bit VAs directly from the mapped IMAGE_TLS_DIRECTORY64
+    let index_va = u64::from_le_bytes(buf[tls_off + 16..tls_off + 24].try_into().unwrap()) as usize;
+    let callbacks_va =
+        u64::from_le_bytes(buf[tls_off + 24..tls_off + 32].try_into().unwrap()) as usize;
+
+    // Assign a non-zero TLS slot index into *AddressOfIndex if inside the mapped image
+    if index_va >= base && index_va + 4 <= img_end {
+        let idx = NEXT_TLS_INDEX.fetch_add(1, Ordering::Relaxed);
+        let idx_off = index_va - base;
+        buf[idx_off..idx_off + 4].copy_from_slice(&idx.to_le_bytes());
+    }
+
+    let mut callbacks = Vec::new();
+    if callbacks_va >= base && callbacks_va + 8 <= img_end {
+        let mut off = callbacks_va - base;
+        while off + 8 <= buf.len() {
+            let cb_va = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
+            if cb_va == 0 {
+                break;
+            }
+            if cb_va >= base && cb_va < img_end {
+                callbacks.push(cb_va);
+            }
+            off += 8;
+        }
+    }
+    callbacks
+}
+
+#[cfg(target_os = "windows")]
+fn register_pdata_table(pe: &PeImage, memory: &VirtualMemory) -> Option<usize> {
+    let dir = pe.data_directory(crate::pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION)?;
+    let count = (dir.size as usize) / 12;
+    if count == 0 {
+        return None;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn RtlAddFunctionTable(
+            function_table: *mut RuntimeFunction,
+            entry_count: u32,
+            base_address: u64,
+        ) -> u8;
+    }
+    let ptr = unsafe { memory.base().add(dir.virtual_address as usize) as *mut RuntimeFunction };
+    let ok = unsafe { RtlAddFunctionTable(ptr, count as u32, memory.base_addr() as u64) };
+    if ok != 0 {
+        Some(ptr as usize)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn unregister_pdata_table(table_ptr: usize) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn RtlDeleteFunctionTable(function_table: *mut RuntimeFunction) -> u8;
+    }
+    unsafe {
+        let _ = RtlDeleteFunctionTable(table_ptr as *mut RuntimeFunction);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_pdata_table(_pe: &PeImage, _memory: &VirtualMemory) -> Option<usize> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unregister_pdata_table(_table_ptr: usize) {}
 
 fn section_protection(characteristics: u32) -> PageProtection {
     let r = (characteristics & IMAGE_SCN_MEM_READ) != 0;

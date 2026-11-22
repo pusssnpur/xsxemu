@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use xsx_abi::com::S_OK;
 use xsx_loader::{ImportResolver, ImportSymbol};
 
-use crate::{d3d12_x, kernelx, xgameruntime};
+use crate::{d3d12_x, dstorage, input, kernelx, services, xaudio2, xgameruntime};
 
 /// Generic fallback Win64 stub returning `S_OK` (0).
 unsafe extern "win64" fn unimplemented_stub() -> i32 {
@@ -22,7 +22,7 @@ pub struct ModuleRegistry {
 }
 
 impl ModuleRegistry {
-    /// Construct the default Xbox Series X HLE registry with all implemented modules registered.
+    /// Construct the default Xbox Series X HLE registry with all Phase 1–4 modules registered.
     pub fn new_default(allow_stubs: bool) -> Self {
         let mut reg = Self {
             exports: HashMap::new(),
@@ -30,7 +30,11 @@ impl ModuleRegistry {
         };
         kernelx::register(&mut reg);
         xgameruntime::register(&mut reg);
+        services::register(&mut reg);
         d3d12_x::register(&mut reg);
+        input::register(&mut reg);
+        xaudio2::register(&mut reg);
+        dstorage::register(&mut reg);
         reg
     }
 
@@ -73,6 +77,9 @@ pub fn normalize_dll(dll: &str) -> String {
     if lower == "d3d12_xs.dll" || lower == "d3d12_x.dll" || lower == "d3d12.dll" {
         return "d3d12_x.dll".to_string();
     }
+    if lower == "xuser.dll" || lower == "xstore.dll" || lower == "xgamesave.dll" {
+        return "xgameruntime.dll".to_string();
+    }
     lower
 }
 
@@ -100,5 +107,26 @@ mod tests {
             name: "D3D12XBOX_CreateDevice".into(),
         };
         assert!(reg.resolve("d3d12_xs.dll", &sym).is_some());
+    }
+
+    #[test]
+    fn phase4_modules_resolve_cleanly() {
+        let reg = ModuleRegistry::new_default(false);
+        for (dll, name) in [
+            ("xinput1_4.dll", "XInputGetState"),
+            ("gameinput.dll", "GameInputCreate"),
+            ("xaudio2_9.dll", "XAudio2Create"),
+            ("dstorage_x.dll", "DStorageGetFactory"),
+            ("xuser.dll", "XUserGetGamertag"),
+            ("xgamesave.dll", "XGameSaveInitializeProvider"),
+        ] {
+            let sym = ImportSymbol::Name {
+                hint: 0,
+                name: name.into(),
+            };
+            let res = reg.resolve(dll, &sym);
+            assert!(res.is_some(), "expected {dll}!{name} to resolve");
+            assert!(!res.unwrap().1);
+        }
     }
 }

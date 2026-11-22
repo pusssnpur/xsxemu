@@ -102,3 +102,79 @@ pub const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 pub const WAIT_OBJECT_0: u32 = 0x0000_0000;
 pub const WAIT_TIMEOUT: u32 = 0x0000_0102;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
+pub const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// `DllMain` / `PIMAGE_TLS_CALLBACK` reason codes.
+pub const DLL_PROCESS_DETACH: u32 = 0;
+pub const DLL_PROCESS_ATTACH: u32 = 1;
+pub const DLL_THREAD_ATTACH: u32 = 2;
+pub const DLL_THREAD_DETACH: u32 = 3;
+
+/// File I/O access & creation disposition flags.
+pub const GENERIC_READ: u32 = 0x8000_0000;
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+
+pub const CREATE_NEW: u32 = 1;
+pub const CREATE_ALWAYS: u32 = 2;
+pub const OPEN_EXISTING: u32 = 3;
+pub const OPEN_ALWAYS: u32 = 4;
+pub const TRUNCATE_EXISTING: u32 = 5;
+
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+pub const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+
+pub const FILE_BEGIN: u32 = 0;
+pub const FILE_CURRENT: u32 = 1;
+pub const FILE_END: u32 = 2;
+
+/// Win32 `SRWLOCK` (pointer-sized opaque lock slot).
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct SrwLock {
+    pub ptr: usize,
+}
+
+/// Win32 `CRITICAL_SECTION` (40 bytes on Win64).
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct CriticalSection {
+    pub debug_info: usize,
+    pub lock_count: i32,
+    pub recursion_count: i32,
+    pub owning_thread: usize,
+    pub lock_semaphore: usize,
+    pub spin_count: usize,
+}
+
+/// Windows x64 `.pdata` `IMAGE_RUNTIME_FUNCTION_ENTRY` (12 bytes).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RuntimeFunction {
+    pub begin_address: u32,
+    pub end_address: u32,
+    pub unwind_info_address: u32,
+}
+
+/// Win64 `PIMAGE_TLS_CALLBACK` signature.
+pub type TlsCallbackFn =
+    unsafe extern "win64" fn(dll_handle: *mut c_void, reason: u32, reserved: *mut c_void);
+
+/// Win64 `DllMain` signature.
+pub type DllMainFn =
+    unsafe extern "win64" fn(hinst_dll: *mut c_void, fdw_reason: u32, lpv_reserved: *mut c_void) -> i32;
+
+/// Win64 `LPTHREAD_START_ROUTINE` signature.
+pub type ThreadStartRoutine = unsafe extern "win64" fn(lp_thread_parameter: *mut c_void) -> u32;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn win64_sync_and_pdata_sizes() {
+        assert_eq!(core::mem::size_of::<SrwLock>(), 8);
+        assert_eq!(core::mem::size_of::<CriticalSection>(), 40);
+        assert_eq!(core::mem::size_of::<RuntimeFunction>(), 12);
+    }
+}

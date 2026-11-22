@@ -228,6 +228,18 @@ impl GpuBackend for SoftwareD3D12Backend {
                     start_vertex,
                     ..
                 } => self.draw_instanced(*vertex_count, *start_vertex),
+                GpuCommand::SetPipelineState { .. }
+                | GpuCommand::SetGraphicsRootSignature { .. }
+                | GpuCommand::SetComputeRootSignature { .. }
+                | GpuCommand::Dispatch { .. } => {}
+                GpuCommand::CopyResource { dst_id, src_id } => {
+                    if let Some(src_bytes) = self.resources.get(src_id).map(|r| r.data.to_vec()) {
+                        if let Some(dst) = self.resources.get_mut(dst_id) {
+                            let n = dst.data.len().min(src_bytes.len());
+                            dst.data[..n].copy_from_slice(&src_bytes[..n]);
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -238,6 +250,7 @@ impl GpuBackend for SoftwareD3D12Backend {
         resource_id: Option<u64>,
         frame_index: u64,
         _sync_interval: u32,
+        _fsr_plan: Option<&crate::fsr::FsrComputePlan>,
     ) -> Result<Option<PresentedFrame>, String> {
         let target_id = resource_id.or(self.last_rtv_resource);
         if let Some(id) = target_id {
