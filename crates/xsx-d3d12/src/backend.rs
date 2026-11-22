@@ -1,0 +1,393 @@
+//! Core GPU backend abstraction, command IR, framebuffer representation, and `D3D12Translator`.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use xsx_abi::d3d12::{
+    D3D12HeapProperties, D3D12Rect, D3D12ResourceDesc, D3D12ResourceDimension,
+    D3D12VertexBufferView, D3D12Viewport,
+};
+
+use crate::native_win;
+use crate::software::SoftwareD3D12Backend;
+use crate::translate::{translate_heap_properties, HostDeviceCreateConfig};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    /// Use native Windows D3D12 on Windows x86_64, software D3D12 otherwise.
+    Auto,
+    /// Force native Windows D3D12 (`d3d12.dll` + `dxgi.dll`).
+    NativeD3D12,
+    /// Force software D3D12 command executor & rasterizer (works headless on all OSes).
+    Software,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranslatorConfig {
+    pub backend: BackendKind,
+    pub trace_calls: bool,
+    pub default_width: u32,
+    pub default_height: u32,
+}
+
+impl Default for TranslatorConfig {
+    fn default() -> Self {
+        Self {
+            backend: BackendKind::Auto,
+            trace_calls: false,
+            default_width: 640,
+            default_height: 360,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    Buffer { size_bytes: usize },
+    Texture2D { width: u32, height: u32, format: u32 },
+}
+
+/// Recorded Direct3D 12 graphics command.
+#[derive(Debug, Clone)]
+pub enum GpuCommand {
+    ResourceBarrier {
+        resource_id: u64,
+        before: u32,
+        after: u32,
+    },
+    SetViewport(D3D12Viewport),
+    SetScissor(D3D12Rect),
+    SetRenderTarget {
+        rtv_handle: usize,
+    },
+    ClearRenderTarget {
+        rtv_handle: usize,
+        color: [f32; 4],
+        rects: Vec<D3D12Rect>,
+    },
+    SetPrimitiveTopology(u32),
+    SetVertexBuffer {
+        slot: u32,
+        view: D3D12VertexBufferView,
+    },
+    DrawInstanced {
+        vertex_count: u32,
+        instance_count: u32,
+        start_vertex: u32,
+        start_instance: u32,
+    },
+}
+
+/// Captured RGBA8 framebuffer produced by `PresentX`.
+#[derive(Debug, Clone)]
+pub struct PresentedFrame {
+    pub frame_index: u64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl PresentedFrame {
+    /// Save this RGBA8 framebuffer as a binary PPM (`P6`) image.
+    pub fn write_ppm(&self, path: &Path) -> io::Result<()> {
+        let mut f = File::create(path)?;
+        write!(f, "P6\n{} {}\n255\n", self.width, self.height)?;
+        let mut rgb = Vec::with_capacity((self.width * self.height * 3) as usize);
+        for px in self.rgba.chunks_exact(4) {
+            rgb.push(px[0]);
+            rgb.push(px[1]);
+            rgb.push(px[2]);
+        }
+        f.write_all(&rgb)
+    }
+
+    /// Save this RGBA8 framebuffer as an uncompressed 24-bit Windows BMP image.
+    pub fn write_bmp(&self, path: &Path) -> io::Result<()> {
+        let row_stride = ((self.width * 3 + 3) & !3) as usize;
+        let pixel_bytes = row_stride * self.height as usize;
+        let file_size = 54 + pixel_bytes;
+
+        let mut buf = Vec::with_capacity(file_size);
+        // BITMAPFILEHEADER (14 bytes)
+        buf.extend_from_slice(b"BM");
+        buf.extend_from_slice(&(file_size as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&54u32.to_le_bytes());
+        // BITMAPINFOHEADER (40 bytes)
+        buf.extend_from_slice(&40u32.to_le_bytes());
+        buf.extend_from_slice(&(self.width as i32).to_le_bytes());
+        buf.extend_from_slice(&(self.height as i32).to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes()); // planes
+        buf.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        buf.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+        buf.extend_from_slice(&(pixel_bytes as u32).to_le_bytes());
+        buf.extend_from_slice(&2835i32.to_le_bytes());
+        buf.extend_from_slice(&2835i32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        // Bottom-up BGR rows
+        for y in (0..self.height as usize).rev() {
+            let row_start = y * self.width as usize * 4;
+            for x in 0..self.width as usize {
+                let off = row_start + x * 4;
+                buf.push(self.rgba[off + 2]); // B
+                buf.push(self.rgba[off + 1]); // G
+                buf.push(self.rgba[off]); // R
+            }
+            for _ in (self.width as usize * 3)..row_stride {
+                buf.push(0);
+            }
+        }
+
+        let mut f = File::create(path)?;
+        f.write_all(&buf)
+    }
+
+    pub fn pixel_rgba(&self, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y * self.width + x) * 4) as usize;
+        [
+            self.rgba[idx],
+            self.rgba[idx + 1],
+            self.rgba[idx + 2],
+            self.rgba[idx + 3],
+        ]
+    }
+}
+
+/// Host GPU backend interface implemented by `NativeD3D12Backend` (Windows) and `SoftwareD3D12Backend`.
+pub trait GpuBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    fn create_resource(
+        &mut self,
+        id: u64,
+        heap_props: &D3D12HeapProperties,
+        heap_flags: u32,
+        desc: &D3D12ResourceDesc,
+        initial_state: u32,
+    ) -> Result<u64, String>;
+
+    fn map_resource(&mut self, id: u64) -> Result<*mut u8, String>;
+    fn unmap_resource(&mut self, id: u64);
+
+    fn create_rtv(&mut self, rtv_handle: usize, resource_id: u64);
+
+    fn execute_commands(&mut self, commands: &[GpuCommand]) -> Result<(), String>;
+
+    fn present_resource(
+        &mut self,
+        resource_id: Option<u64>,
+        frame_index: u64,
+        sync_interval: u32,
+    ) -> Result<Option<PresentedFrame>, String>;
+}
+
+/// Central thread-safe Xbox `d3d12_x` translation state shared by all live COM objects.
+pub struct D3D12Translator {
+    config: TranslatorConfig,
+    backend: Mutex<Box<dyn GpuBackend>>,
+    next_id: AtomicU64,
+    next_frame_token: AtomicU64,
+    next_rtv_handle: AtomicU64,
+    fences: Mutex<HashMap<u64, u64>>,
+    presented_frames: Mutex<Vec<PresentedFrame>>,
+    trace_log: Mutex<Vec<String>>,
+    backend_name: &'static str,
+}
+
+impl D3D12Translator {
+    pub fn new(
+        config: TranslatorConfig,
+        device_cfg: HostDeviceCreateConfig,
+    ) -> Result<Arc<Self>, String> {
+        let backend: Box<dyn GpuBackend> = match config.backend {
+            BackendKind::Software => Box::new(SoftwareD3D12Backend::new(
+                config.default_width,
+                config.default_height,
+            )),
+            BackendKind::NativeD3D12 => native_win::create_native_backend(
+                config.default_width,
+                config.default_height,
+                device_cfg,
+            )?,
+            BackendKind::Auto => {
+                #[cfg(target_os = "windows")]
+                {
+                    match native_win::create_native_backend(
+                        config.default_width,
+                        config.default_height,
+                        device_cfg,
+                    ) {
+                        Ok(b) => b,
+                        Err(_) => Box::new(SoftwareD3D12Backend::new(
+                            config.default_width,
+                            config.default_height,
+                        )),
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = device_cfg;
+                    Box::new(SoftwareD3D12Backend::new(
+                        config.default_width,
+                        config.default_height,
+                    ))
+                }
+            }
+        };
+
+        let backend_name = backend.name();
+        Ok(Arc::new(Self {
+            config,
+            backend: Mutex::new(backend),
+            next_id: AtomicU64::new(1),
+            next_frame_token: AtomicU64::new(1),
+            next_rtv_handle: AtomicU64::new(0x1000_0000),
+            fences: Mutex::new(HashMap::new()),
+            presented_frames: Mutex::new(Vec::new()),
+            trace_log: Mutex::new(Vec::new()),
+            backend_name,
+        }))
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend_name
+    }
+
+    pub fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn next_frame_token(&self) -> u64 {
+        self.next_frame_token.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn alloc_descriptor_range(&self, count: u32, increment: usize) -> usize {
+        let span = (count.max(1) as u64) * (increment as u64);
+        self.next_rtv_handle.fetch_add(span, Ordering::Relaxed) as usize
+    }
+
+    pub fn record_trace(&self, msg: impl Into<String>) {
+        let s = msg.into();
+        if self.config.trace_calls {
+            eprintln!("[d3d12_x] {s}");
+        }
+        if let Ok(mut log) = self.trace_log.lock() {
+            log.push(s);
+        }
+    }
+
+    pub fn trace_log(&self) -> Vec<String> {
+        self.trace_log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    pub fn presented_frames(&self) -> Vec<PresentedFrame> {
+        self.presented_frames
+            .lock()
+            .map(|f| f.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn create_committed_resource(
+        &self,
+        heap_props: &D3D12HeapProperties,
+        xbox_heap_flags: u32,
+        desc: &D3D12ResourceDesc,
+        initial_state: u32,
+    ) -> Result<(u64, u64, ResourceKind), String> {
+        let id = self.alloc_id();
+        let (host_props, host_flags) = translate_heap_properties(heap_props, xbox_heap_flags);
+        let kind = if desc.dimension == D3D12ResourceDimension::Texture2D as u32 {
+            ResourceKind::Texture2D {
+                width: desc.width as u32,
+                height: desc.height,
+                format: desc.format,
+            }
+        } else {
+            ResourceKind::Buffer {
+                size_bytes: desc.width as usize,
+            }
+        };
+
+        let gpu_va = self
+            .backend
+            .lock()
+            .unwrap()
+            .create_resource(id, &host_props, host_flags, desc, initial_state)?;
+
+        self.record_trace(format!(
+            "CreateCommittedResource(id={id}, kind={kind:?}, xbox_flags=0x{xbox_heap_flags:X} -> host_flags=0x{host_flags:X}, gpu_va=0x{gpu_va:X})"
+        ));
+        Ok((id, gpu_va, kind))
+    }
+
+    pub fn map_resource(&self, id: u64) -> Result<*mut u8, String> {
+        self.backend.lock().unwrap().map_resource(id)
+    }
+
+    pub fn unmap_resource(&self, id: u64) {
+        self.backend.lock().unwrap().unmap_resource(id);
+    }
+
+    pub fn create_rtv(&self, rtv_handle: usize, resource_id: u64) {
+        self.record_trace(format!(
+            "CreateRenderTargetView(rtv=0x{rtv_handle:X}, resource_id={resource_id})"
+        ));
+        self.backend
+            .lock()
+            .unwrap()
+            .create_rtv(rtv_handle, resource_id);
+    }
+
+    pub fn create_fence(&self, initial_value: u64) -> u64 {
+        let id = self.alloc_id();
+        self.fences.lock().unwrap().insert(id, initial_value);
+        self.record_trace(format!("CreateFence(id={id}, initial={initial_value})"));
+        id
+    }
+
+    pub fn signal_fence(&self, id: u64, value: u64) {
+        if let Some(slot) = self.fences.lock().unwrap().get_mut(&id) {
+            *slot = value;
+        }
+        self.record_trace(format!("CommandQueue::Signal(fence={id}, value={value})"));
+    }
+
+    pub fn fence_value(&self, id: u64) -> u64 {
+        self.fences.lock().unwrap().get(&id).copied().unwrap_or(0)
+    }
+
+    pub fn execute_command_list(&self, commands: &[GpuCommand]) -> Result<(), String> {
+        self.record_trace(format!(
+            "CommandQueue::ExecuteCommandLists(commands={})",
+            commands.len()
+        ));
+        self.backend.lock().unwrap().execute_commands(commands)
+    }
+
+    pub fn present_x(
+        &self,
+        resource_id: Option<u64>,
+        frame_token: u64,
+        sync_interval: u32,
+    ) -> Result<(), String> {
+        self.record_trace(format!(
+            "CommandQueue::PresentX(resource={resource_id:?}, token={frame_token}, sync={sync_interval})"
+        ));
+        let frame_idx = self.presented_frames.lock().unwrap().len() as u64;
+        if let Some(frame) =
+            self.backend
+                .lock()
+                .unwrap()
+                .present_resource(resource_id, frame_idx, sync_interval)?
+        {
+            self.presented_frames.lock().unwrap().push(frame);
+        }
+        Ok(())
+    }
+}

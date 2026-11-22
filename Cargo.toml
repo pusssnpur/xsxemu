@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xsx-abi",
+    "crates/xsx-loader",
+    "crates/xsx-d3d12",
+    "crates/xsx-hle",
+    "crates/xsx-testgen",
+    "crates/xsxemu",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/pusssnpur/xsxemu"
+description = "Clean-room Xbox Series X|S game translation layer in Rust targeting Windows x86_64 with native Direct3D 12"
+
+[workspace.dependencies]
+xsx-abi = { path = "crates/xsx-abi" }
+xsx-loader = { path = "crates/xsx-loader" }
+xsx-d3d12 = { path = "crates/xsx-d3d12" }
+xsx-hle = { path = "crates/xsx-hle" }
+xsx-testgen = { path = "crates/xsx-testgen" }

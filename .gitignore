@@ -1,0 +1,9 @@
+/target
+Cargo.lock
+*.exe
+*.dll
+*.pdb
+*.ppm
+*.bmp
+*.png
+.DS_Store

@@ -1,0 +1,9 @@
+[package]
+name = "xsx-testgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+xsx-abi = { workspace = true }
+xsx-loader = { workspace = true }

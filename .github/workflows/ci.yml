@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build workspace
+        run: cargo build --workspace
+      - name: Run workspace tests
+        run: cargo test --workspace -- --nocapture
+      - name: Run CLI end-to-end smoke test
+        shell: bash
+        run: |
+          cargo run -p xsxemu -- gen-sample hello_xsx.exe
+          cargo run -p xsxemu -- inspect hello_xsx.exe
+          cargo run -p xsxemu -- run hello_xsx.exe --backend software --trace --force-relocate --dump-frame frame.bmp
+          test -s frame.bmp
