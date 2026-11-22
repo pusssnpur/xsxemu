@@ -198,15 +198,16 @@ unsafe extern "win64" fn unimplemented_stub_hresult() -> i32 {
     }
 }
 
-/// Maps normalized DLL names and export names to Win64-callable Rust HLE thunks.
+/// Maps normalized DLL names and export names (or ordinals) to Win64-callable Rust HLE thunks.
 pub struct ModuleRegistry {
     exports: HashMap<(String, String), usize>,
+    ordinals: HashMap<(String, u16), usize>,
     allow_stubs: bool,
     policy: UnimplementedPolicy,
 }
 
 impl ModuleRegistry {
-    /// Construct the default Xbox Series X HLE registry with all Phase 1–6 modules registered.
+    /// Construct the default Xbox Series X HLE registry with all Phase 1–7 modules registered.
     pub fn new_default(allow_stubs: bool) -> Self {
         Self::with_policy(allow_stubs, get_unimplemented_policy())
     }
@@ -214,6 +215,7 @@ impl ModuleRegistry {
     pub fn with_policy(allow_stubs: bool, policy: UnimplementedPolicy) -> Self {
         let mut reg = Self {
             exports: HashMap::new(),
+            ordinals: HashMap::new(),
             allow_stubs,
             policy,
         };
@@ -223,6 +225,10 @@ impl ModuleRegistry {
         xgameruntime::register(&mut reg);
         services::register(&mut reg);
         d3d12_x::register(&mut reg);
+        crate::xg_xs::register(&mut reg);
+        crate::acphal::register(&mut reg);
+        crate::middleware::register(&mut reg);
+        crate::net::register(&mut reg);
         input::register(&mut reg);
         xaudio2::register(&mut reg);
         dstorage::register(&mut reg);
@@ -232,6 +238,10 @@ impl ModuleRegistry {
     pub fn register_export(&mut self, dll: &str, name: &str, addr: usize) {
         self.exports
             .insert((normalize_dll(dll), name.to_string()), addr);
+    }
+
+    pub fn register_ordinal(&mut self, dll: &str, ordinal: u16, addr: usize) {
+        self.ordinals.insert((normalize_dll(dll), ordinal), addr);
     }
 
     pub fn export_count(&self) -> usize {
@@ -244,20 +254,34 @@ impl ModuleRegistry {
         self.exports.get(&(norm, name.to_string())).copied()
     }
 
+    /// Look up an ordinal export from an owned HLE DLL.
+    pub fn lookup_owned_ordinal(&self, dll: &str, ordinal: u16) -> Option<usize> {
+        let norm = normalize_dll(dll);
+        self.ordinals.get(&(norm, ordinal)).copied()
+    }
+
     /// Returns `true` if `dll` is served directly by our HLE shim registry (so `LoadLibraryA/W`
     /// and `GetModuleHandleA/W` return a pseudo-handle instead of falling through).
     pub fn owns_dll(&self, dll: &str) -> bool {
         let norm = normalize_dll(dll);
         self.exports.keys().any(|(d, _)| d == &norm)
+            || self.ordinals.keys().any(|(d, _)| d == &norm)
     }
 }
 
 impl ImportResolver for ModuleRegistry {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Option<(usize, bool)> {
         let norm_dll = normalize_dll(dll);
-        if let ImportSymbol::Name { name, .. } = symbol {
-            if let Some(&addr) = self.exports.get(&(norm_dll, name.clone())) {
-                return Some((addr, false));
+        match symbol {
+            ImportSymbol::Name { name, .. } => {
+                if let Some(&addr) = self.exports.get(&(norm_dll, name.clone())) {
+                    return Some((addr, false));
+                }
+            }
+            ImportSymbol::Ordinal(ord) => {
+                if let Some(&addr) = self.ordinals.get(&(norm_dll, *ord)) {
+                    return Some((addr, false));
+                }
             }
         }
         if self.allow_stubs {
@@ -318,6 +342,21 @@ pub fn normalize_dll(dll: &str) -> String {
     }
     if lower == "xuser.dll" || lower == "xstore.dll" || lower == "xgamesave.dll" {
         return "xgameruntime.dll".to_string();
+    }
+    if lower == "xg.dll" || lower == "xg_x.dll" || lower == "xg_xs.dll" {
+        return "xg_xs.dll".to_string();
+    }
+    if lower == "xapu.dll" || lower == "acphal.dll" {
+        return "acphal.dll".to_string();
+    }
+    if lower == "bink2scarlett.dll" || lower == "bink2w64_scarlett.dll" {
+        return "bink2w64_scarlett.dll".to_string();
+    }
+    if lower == "libhttpclient.dll" || lower == "libhttpclient.gdk.dll" {
+        return "libhttpclient.gdk.dll".to_string();
+    }
+    if lower == "pixrt.dll" || lower == "pixeventruntime.dll" || lower == "pixevt.dll" {
+        return "pixevt.dll".to_string();
     }
     lower
 }

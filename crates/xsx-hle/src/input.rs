@@ -40,16 +40,121 @@ impl VirtualGamepadState {
     }
 }
 
+/// Keyboard keys that map cleanly onto a virtual Xbox Series X controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyCode {
+    W,
+    A,
+    S,
+    D,
+    Up,
+    Down,
+    Left,
+    Right,
+    Space,
+    Enter,
+    Escape,
+    Backspace,
+    Q,
+    E,
+    Tab,
+    P,
+    Z,
+    X,
+}
+
+/// Maps desktop keyboard press/release events onto an Xbox Series X `XInputGamepad`.
+#[derive(Debug, Default, Clone)]
+pub struct KeyboardGamepadMapper {
+    held: std::collections::HashSet<KeyCode>,
+}
+
+impl KeyboardGamepadMapper {
+    pub fn key_down(&mut self, key: KeyCode) -> XInputGamepad {
+        self.held.insert(key);
+        self.to_gamepad()
+    }
+
+    pub fn key_up(&mut self, key: KeyCode) -> XInputGamepad {
+        self.held.remove(&key);
+        self.to_gamepad()
+    }
+
+    pub fn to_gamepad(&self) -> XInputGamepad {
+        let mut buttons: u16 = 0;
+        if self.held.contains(&KeyCode::Up) {
+            buttons |= 0x0001; // DPAD_UP
+        }
+        if self.held.contains(&KeyCode::Down) {
+            buttons |= 0x0002; // DPAD_DOWN
+        }
+        if self.held.contains(&KeyCode::Left) {
+            buttons |= 0x0004; // DPAD_LEFT
+        }
+        if self.held.contains(&KeyCode::Right) {
+            buttons |= 0x0008; // DPAD_RIGHT
+        }
+        if self.held.contains(&KeyCode::P) {
+            buttons |= 0x0010; // START
+        }
+        if self.held.contains(&KeyCode::Tab) {
+            buttons |= 0x0020; // BACK
+        }
+        if self.held.contains(&KeyCode::Q) {
+            buttons |= 0x0100; // LEFT_SHOULDER
+        }
+        if self.held.contains(&KeyCode::E) {
+            buttons |= 0x0200; // RIGHT_SHOULDER
+        }
+        if self.held.contains(&KeyCode::Space) || self.held.contains(&KeyCode::Enter) {
+            buttons |= 0x1000; // A
+        }
+        if self.held.contains(&KeyCode::Escape) || self.held.contains(&KeyCode::Backspace) {
+            buttons |= 0x2000; // B
+        }
+        if self.held.contains(&KeyCode::X) {
+            buttons |= 0x4000; // X
+        }
+        if self.held.contains(&KeyCode::Z) {
+            buttons |= 0x8000; // Y
+        }
+
+        let lx = match (self.held.contains(&KeyCode::A), self.held.contains(&KeyCode::D)) {
+            (true, false) => -32767i16,
+            (false, true) => 32767i16,
+            _ => 0,
+        };
+        let ly = match (self.held.contains(&KeyCode::S), self.held.contains(&KeyCode::W)) {
+            (true, false) => -32767i16,
+            (false, true) => 32767i16,
+            _ => 0,
+        };
+
+        XInputGamepad {
+            w_buttons: buttons,
+            b_left_trigger: 0,
+            b_right_trigger: 0,
+            s_thumb_lx: lx,
+            s_thumb_ly: ly,
+            s_thumb_rx: 0,
+            s_thumb_ry: 0,
+        }
+    }
+}
+
 pub fn register(reg: &mut ModuleRegistry) {
     for dll in ["xinput1_4.dll", "xinput9_1_0.dll", "xinput1_3.dll"] {
         reg.register_export(dll, "XInputGetState", hle_xinput_get_state as *const () as usize);
         reg.register_export(dll, "XInputSetState", hle_xinput_set_state as *const () as usize);
+        reg.register_ordinal(dll, 2, hle_xinput_get_state as *const () as usize);
+        reg.register_ordinal(dll, 3, hle_xinput_set_state as *const () as usize);
     }
     reg.register_export(
         "gameinput.dll",
         "GameInputCreate",
         hle_gameinput_create as *const () as usize,
     );
+    reg.register_ordinal("gameinput.dll", 1, hle_gameinput_create as *const () as usize);
 }
 
 #[cfg(target_os = "windows")]

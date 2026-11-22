@@ -8,15 +8,18 @@ use std::sync::{Arc, Mutex};
 
 use xsx_d3d12::fsr::process_frame;
 use xsx_d3d12::{
-    inspect_xbox_shader_blob, BackendKind, FsrConfig, FsrQualityMode, PresentedFrame,
-    TranslatorConfig,
+    disassemble_rdna2, extract_fssm_program, extract_fspx_parts, format_rdna2_disassembly,
+    inspect_xbox_shader_blob, lift_rdna2_to_hlsl, BackendKind, FsrConfig, FsrQualityMode,
+    PresentedFrame, ShaderStage, TranslatorConfig,
 };
 use xsx_hle::{
-    classify_import_return_class, set_guest_command_line, set_unimplemented_policy, GuestRuntime,
-    ModuleRegistry, ReturnClass, RtcConfig, RuntimeGuard, StartupTracer, UnimplementedPolicy,
-    VirtualFs,
+    classify_import_return_class, set_active_title_id, set_guest_command_line,
+    set_unimplemented_policy, GuestRuntime, ModuleRegistry, ReturnClass, RtcConfig, RuntimeGuard,
+    StartupTracer, UnimplementedPolicy, VirtualFs,
 };
-use xsx_loader::{default_search_dirs, ImportSymbol, LoadedModuleSet, PeImage};
+use xsx_loader::{
+    default_search_dirs, GameConfig, ImportSymbol, LoadedModuleSet, PeImage, XvdContainer,
+};
 use xsx_testgen::{
     build_full_stack_xsx_pe, build_hello_xsx_pe, build_helper_dll_pe, build_phase2_xsx_pe,
     build_real_game_xsx_pe, FULLSTACK_ASSET_PAYLOAD, REALGAME_PKG_CONFIG,
@@ -33,7 +36,11 @@ fn print_usage() {
            xsxemu gen-realgame <output_dir>\n\
            xsxemu inspect <binary.exe|dll>\n\
            xsxemu inspect-shader <shader.bin>\n\
-           xsxemu run <binary.exe> [OPTIONS] [-- guest-args...]\n\
+           xsxemu inspect-xvd <container.xvd>\n\
+           xsxemu disasm <shader.bin>\n\
+           xsxemu lift-hlsl <shader.bin> [--stage vs|ps|cs]\n\
+           xsxemu boot <package_dir> [RUN OPTIONS] [-- guest-args...]\n\
+           xsxemu run <binary.exe> [RUN OPTIONS] [-- guest-args...]\n\
            xsxemu bench-fsr [--width W] [--height H] [--fsr MODE]\n\
          \n\
          RUN OPTIONS:\n\
@@ -76,6 +83,10 @@ fn main() -> ExitCode {
         "gen-realgame" => cmd_gen_realgame(&args[1..]),
         "inspect" => cmd_inspect(&args[1..]),
         "inspect-shader" => cmd_inspect_shader(&args[1..]),
+        "inspect-xvd" => cmd_inspect_xvd(&args[1..]),
+        "disasm" => cmd_disasm(&args[1..]),
+        "lift-hlsl" => cmd_lift_hlsl(&args[1..]),
+        "boot" => cmd_boot(&args[1..]),
         "run" => cmd_run(&args[1..]),
         "bench-fsr" => cmd_bench_fsr(&args[1..]),
         "-h" | "--help" | "help" => {
@@ -236,6 +247,169 @@ fn cmd_inspect_shader(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn extract_shader_isa(bytes: &[u8]) -> Vec<u8> {
+    if let Some(fssm) = extract_fssm_program(bytes) {
+        return fssm;
+    }
+    if let Some(fspx) = extract_fspx_parts(bytes) {
+        if !fspx.code.is_empty() {
+            return fspx.code.to_vec();
+        }
+    }
+    bytes.to_vec()
+}
+
+fn cmd_inspect_xvd(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: xsxemu inspect-xvd <container.xvd>");
+        return ExitCode::from(2);
+    };
+    let xvd = match XvdContainer::open_file(Path::new(path)) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("XVD parse error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let h = xvd.header();
+    println!("=== Xbox Virtual Disk (XVD) Inspection: {path} ===");
+    println!("Magic:             {}", h.magic);
+    println!("Format Version:    {}", h.format_version);
+    println!("Content Type:      {}", h.content_type);
+    println!("Content ID:        {}", h.content_id_hex());
+    println!("Volume Flags:      0x{:08X}", h.volume_flags);
+    println!("Encrypted:         {}", h.is_encrypted);
+    println!("Data Integrity:    {}", h.has_data_integrity);
+    println!("Drive Size:        {} bytes", h.drive_size);
+    println!("User Data Offset:  0x{:X}", h.user_data_offset);
+    println!("User Data Length:  {} bytes", h.user_data_length);
+    ExitCode::SUCCESS
+}
+
+fn cmd_disasm(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: xsxemu disasm <shader.bin>");
+        return ExitCode::from(2);
+    };
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let isa = extract_shader_isa(&bytes);
+    let insns = disassemble_rdna2(&isa);
+    println!(
+        "; RDNA 2 Disassembly: {path} ({} bytes -> {} instructions)",
+        isa.len(),
+        insns.len()
+    );
+    print!("{}", format_rdna2_disassembly(&insns));
+    ExitCode::SUCCESS
+}
+
+fn cmd_lift_hlsl(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: xsxemu lift-hlsl <shader.bin> [--stage vs|ps|cs]");
+        return ExitCode::from(2);
+    };
+    let mut stage = ShaderStage::Pixel;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--stage" {
+            i += 1;
+            if let Some(s) = args.get(i).and_then(|v| ShaderStage::parse(v)) {
+                stage = s;
+            } else {
+                eprintln!("invalid --stage (expected vs, ps, or cs)");
+                return ExitCode::from(2);
+            }
+        }
+        i += 1;
+    }
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let isa = extract_shader_isa(&bytes);
+    match lift_rdna2_to_hlsl(&isa, stage) {
+        Ok(lifted) => {
+            println!(
+                "// Lifted {} / {} instructions ({} comments) -> {} ({})",
+                lifted.lifted_count,
+                lifted.instruction_count,
+                lifted.fallback_comments,
+                lifted.entry_point,
+                lifted.profile
+            );
+            print!("{}", lifted.hlsl);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("HLSL lift error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_boot(args: &[String]) -> ExitCode {
+    let Some(pkg_str) = args.first() else {
+        eprintln!("usage: xsxemu boot <package_dir> [RUN OPTIONS] [-- guest-args...]");
+        return ExitCode::from(2);
+    };
+    let pkg_dir = Path::new(pkg_str);
+    let (cfg, manifest_path) = match GameConfig::load_from_package_dir(pkg_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to load MicrosoftGame.Config from {}: {e}", pkg_dir.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(tid) = cfg.title_id_u32 {
+        set_active_title_id(tid);
+    }
+    let Some(exe_path) = cfg.resolve_primary_executable_path(pkg_dir) else {
+        eprintln!("MicrosoftGame.Config lists no executable");
+        return ExitCode::FAILURE;
+    };
+    println!("=== Xbox Series X Package Boot ({}) ===", manifest_path.display());
+    println!(
+        "Display Name:      {}",
+        if cfg.display_name.is_empty() {
+            &cfg.identity_name
+        } else {
+            &cfg.display_name
+        }
+    );
+    println!("TitleId:           {}", cfg.title_id);
+    if !cfg.store_id.is_empty() {
+        println!("StoreId:           {}", cfg.store_id);
+    }
+    println!(
+        "Anaconda Memory:   {:?} ({:.1} GiB budget)",
+        cfg.anaconda_memory_mode,
+        cfg.anaconda_memory_mode.anaconda_budget_bytes() as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+    if let Some(mb) = cfg.persistent_local_storage_mb {
+        println!("PLS Quota (S:\\):   {} MiB", mb);
+    }
+    println!("Primary Executable: {}", exe_path.display());
+
+    // Forward into cmd_run with --game-dir <package_dir> prepended unless already given
+    let mut forwarded = vec![exe_path.to_string_lossy().into_owned()];
+    let has_game_dir = args[1..].iter().any(|a| a == "--game-dir");
+    if !has_game_dir {
+        forwarded.push("--game-dir".into());
+        forwarded.push(pkg_str.clone());
+    }
+    forwarded.extend_from_slice(&args[1..]);
+    cmd_run(&forwarded)
+}
+
 fn cmd_bench_fsr(args: &[String]) -> ExitCode {
     let mut width: u32 = 1280;
     let mut height: u32 = 720;
@@ -365,6 +539,16 @@ fn cmd_inspect(args: &[String]) -> ExitCode {
         println!("  {} ({} symbols):", desc.dll_name, desc.entries.len());
         for entry in &desc.entries {
             println!("    IAT RVA 0x{:08X} -> {}", entry.iat_rva, entry.symbol);
+        }
+    }
+
+    if !pe.delay_imports.is_empty() {
+        println!("Delay-Load Import Table ({} DLLs):", pe.delay_imports.len());
+        for desc in &pe.delay_imports {
+            println!("  {} ({} symbols):", desc.dll_name, desc.entries.len());
+            for entry in &desc.entries {
+                println!("    Delay IAT RVA 0x{:08X} -> {}", entry.iat_rva, entry.symbol);
+            }
         }
     }
 
@@ -689,7 +873,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "DRY-RUN {}  preferred=0x{:016X} size=0x{:X} entry=+0x{:X}",
             main_name, pe.image_base, pe.size_of_image, pe.entry_point_rva
         );
-        for desc in &pe.imports {
+        for desc in pe.imports.iter().chain(pe.delay_imports.iter()) {
             for entry in &desc.entries {
                 let strict = ModuleRegistry::with_policy(false, unimplemented_policy);
                 if xsx_loader::ImportResolver::resolve(&strict, &desc.dll_name, &entry.symbol)

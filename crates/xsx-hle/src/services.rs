@@ -62,7 +62,7 @@ pub fn register(reg: &mut ModuleRegistry) {
 // XUser
 // ===========================================================================
 
-unsafe extern "win64" fn hle_xuser_add_async(
+pub(crate) unsafe extern "win64" fn hle_xuser_add_async(
     _options: u32,
     async_block: *mut XAsyncBlock,
 ) -> HResult {
@@ -77,7 +77,7 @@ unsafe extern "win64" fn hle_xuser_add_async(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xuser_add_result(
+pub(crate) unsafe extern "win64" fn hle_xuser_add_result(
     _async_block: *mut XAsyncBlock,
     new_user: *mut Handle,
 ) -> HResult {
@@ -98,7 +98,7 @@ unsafe extern "win64" fn hle_xuser_add_result(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xuser_get_gamertag(
+pub(crate) unsafe extern "win64" fn hle_xuser_get_gamertag(
     _user: Handle,
     _component: u32,
     gamertag_size: usize,
@@ -118,7 +118,7 @@ unsafe extern "win64" fn hle_xuser_get_gamertag(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xuser_get_id(_user: Handle, user_id: *mut u64) -> HResult {
+pub(crate) unsafe extern "win64" fn hle_xuser_get_id(_user: Handle, user_id: *mut u64) -> HResult {
     if user_id.is_null() {
         return E_INVALIDARG;
     }
@@ -126,7 +126,7 @@ unsafe extern "win64" fn hle_xuser_get_id(_user: Handle, user_id: *mut u64) -> H
     S_OK
 }
 
-unsafe extern "win64" fn hle_xuser_close_handle(user: Handle) {
+pub(crate) unsafe extern "win64" fn hle_xuser_close_handle(user: Handle) {
     if let Some(rt) = current_runtime() {
         rt.close_handle(user);
     }
@@ -142,7 +142,7 @@ fn sanitize_name(raw: &str) -> String {
         .collect()
 }
 
-unsafe extern "win64" fn hle_xgamesave_init_provider(
+pub(crate) unsafe extern "win64" fn hle_xgamesave_init_provider(
     _requesting_user: Handle,
     _scid: *const c_char,
     _sync_on_demand: i32,
@@ -166,7 +166,7 @@ unsafe extern "win64" fn hle_xgamesave_init_provider(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xgamesave_create_container(
+pub(crate) unsafe extern "win64" fn hle_xgamesave_create_container(
     provider: Handle,
     name: *const c_char,
     container_out: *mut Handle,
@@ -199,7 +199,7 @@ unsafe extern "win64" fn hle_xgamesave_create_container(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xgamesave_create_update(
+pub(crate) unsafe extern "win64" fn hle_xgamesave_create_update(
     container: Handle,
     _display_name: *const c_char,
     update_out: *mut Handle,
@@ -222,7 +222,7 @@ unsafe extern "win64" fn hle_xgamesave_create_update(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xgamesave_submit_blob_write(
+pub(crate) unsafe extern "win64" fn hle_xgamesave_submit_blob_write(
     update: Handle,
     blob_name: *const c_char,
     data: *const u8,
@@ -250,7 +250,7 @@ unsafe extern "win64" fn hle_xgamesave_submit_blob_write(
     }
 }
 
-unsafe extern "win64" fn hle_xgamesave_submit_update(update: Handle) -> HResult {
+pub(crate) unsafe extern "win64" fn hle_xgamesave_submit_update(update: Handle) -> HResult {
     let Some(rt) = current_runtime() else {
         return E_FAIL;
     };
@@ -263,7 +263,7 @@ unsafe extern "win64" fn hle_xgamesave_submit_update(update: Handle) -> HResult 
     }
 }
 
-unsafe extern "win64" fn hle_xgamesave_read_blob_data(
+pub(crate) unsafe extern "win64" fn hle_xgamesave_read_blob_data(
     container: Handle,
     blob_name: *const c_char,
     buffer: *mut u8,
@@ -295,7 +295,7 @@ unsafe extern "win64" fn hle_xgamesave_read_blob_data(
     S_OK
 }
 
-unsafe extern "win64" fn hle_xgamesave_close_handle(h: Handle) {
+pub(crate) unsafe extern "win64" fn hle_xgamesave_close_handle(h: Handle) {
     if let Some(rt) = current_runtime() {
         rt.close_handle(h);
     }

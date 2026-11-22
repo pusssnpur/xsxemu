@@ -58,23 +58,31 @@ cargo run -p xsxemu -- run ./realgame_out/realgame_xsx.exe \
   --game-dir ./realgame_out --overlay ./realgame_overlay \
   --unimplemented fail --trace-jsonl ./startup.jsonl --trace
 
-# Inspect real Xbox Series X DXBC / XDAT / XBCH / FSSM / FSPX shader containers
+# Boot an unpacked Xbox Series X package directory via MicrosoftGame.Config (auto-resolves XboxGen9 exe + TitleId + memory budget)
+cargo run -p xsxemu -- boot <package_dir> --overlay ./overlay --unimplemented fail
+
+# Inspect real Xbox Series X shaders, disassemble RDNA 2 ISA, lift to SM 6.0 HLSL, or inspect unencrypted XVDs
 cargo run -p xsxemu -- inspect-shader <shader.bin>
+cargo run -p xsxemu -- disasm <shader.bin>
+cargo run -p xsxemu -- lift-hlsl <shader.bin> --stage ps
+cargo run -p xsxemu -- inspect-xvd <container.xvd>
 ```
 
 ### Real-Game Xbox Series X Compatibility Features
 
-- **Measured `d3d12_xs.dll` ABI Proxy (`crates/xsx-d3d12/src/xs_proxy.rs`, `rootsig.rs`)**:
+- **Package Boot, `MicrosoftGame.Config`, Unencrypted `.xvd`, PE Delay-Load & Ordinal Imports (`crates/xsx-loader`)**:
+  - Parses UTF-8 / UTF-16 LE `MicrosoftGame.Config` manifests (`Identity`, `TitleId` → `XGameGetXboxTitleId`, `StoreId`, `XboxGen9`/`Scarlett` primary executable selection, `PersistentLocalStorage` `S:\` quota, `XboxAnacondaTitleMemory` mode).
+  - Parses public `msft-xvd` (`0x200` magic) container headers and reads unencrypted Dev Mode / synthetic XVD images while cleanly rejecting encrypted retail XVDs.
+  - Parses and eagerly patches **PE Delay-Load Import Directories (`IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT`)** and resolves **ordinal imports** (e.g., `XAudio2_9.dll!#1`, `GameInput.dll!#1`, `XInput1_4.dll!#2/#3`).
+- **Measured `d3d12_xs.dll` ABI Proxy, `xg_xs.dll`, RDNA 2 Disassembler/HLSL Lifter & Software DXR BVH (`crates/xsx-d3d12`, `crates/xsx-hle/src/xg_xs.rs`)**:
   - 84-slot `ID3D12Device` proxy covering `ID3D12Device`..`ID3D12Device14` with measured Xbox Series X deviations: **Slot 62** (`CreateComputePipelineState` with 2 extra words), **Slot 67** (`DeserializeComputePipelineStateX` for FSPX native RDNA 2 compute shaders), **Slot 76** (`CreateCommittedResource` rewriting Xbox `0x101`/`0x1` layout words), and **Heap Slots 9/10** returning 8-byte CPU/GPU descriptor handles directly in `RAX`.
+  - **`xg_xs.dll` / `xg.dll`**: `XGComputeOptimalSwizzleMode` and `XGCreateTexture2DComputer` returning the 9-slot non-IUnknown `IXGTexture2DComputer` (`0x1B40`-byte `XG_RESOURCE_LAYOUT`, 64 KiB RDNA 2 `SW_64KB_S` / `R_X` swizzle & detile).
   - Root signature high-byte Xbox flag stripping (`0xFF00_0000`, observed `0x0300_0000`) on legacy, versioned (1.0/1.1/1.2), and serialized `DXBC`/`RTS0` blobs (with exact Microsoft `d3dcompiler` DXBC MD5-variant checksum recomputation), plus automatic v1.2 → v1.1 downgrade.
-- **AMD RDNA 2 Shaders, Descriptors, Tiling & Hardware BCPack (`rdna2_shader.rs`, `gfx10_desc.rs`, `tiling.rs`, `bcpack/`)**:
-  - Zero-dependency RFC 1950/1951 zlib inflater + SHA-256 to unpack real Xbox Series X `DXBC` → `DXIL` → `XDAT` → `0x0D` `XBCH` → `FSSM` RDNA 2 programs and FidelityFX `FSPX` compute containers.
-  - AMD GFX10/RDNA 2 `T#`/`S#`/`V#` descriptor encoder/decoder, 64 KiB/4 KiB `GetResourceTiling` calculator, 64 KiB `SW_64KB_S`/`R_X` 2D texture swizzle & detile engine, and cycle-accurate Xbox Series X BCPack MDU rANS texture decoder.
-  - Xbox Presentation **Frame Pacer** (`SetFrameIntervalX`, `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX`, `PresentX` token tracking & `ImmediateThresholdPercent` tearing logic, `SuspendX`/`ResumeX`).
-- **Real GDK Runtime, `xmem.dll`, CRT Startup & Non-Destructive CoW VFS (`crates/xsx-hle`)**:
-  - `xgameruntime.lib` dynamic bootstrap (`LoadLibraryW("xgameruntime.dll")` pseudo-handles + `InitializeApiImplEx2` + `QueryApiImpl` serving `IXThreadingImpl`, `IXErrorImpl`, and `IXNetworkingImpl2` COM singletons + in-process `XTaskQueue`/`XAsync` + `XPackage`/`XSystem`).
-  - `xmem.dll` (`XMemAlloc` 64-byte aligned, `XMemFree`, `XMemVirtualAlloc` 64 KiB page mode, `XMemVirtualQuery`, `XMemGetWorkingSetStatistics`, `XMemGetWriteWatch`/`ResetWriteWatch`).
-  - Non-destructive `GAME:\` Copy-on-Write VFS overlay (`--overlay`) with `.xsxemu-deleted` tombstones so retail game packages are never modified, plus `--dry-run`, `--unimplemented <log|fail|stop>` HRESULT classification, and crash-safe `--trace-jsonl`.
+  - Zero-dependency RFC 1950/1951 zlib inflater + SHA-256 (`DXBC` → `DXIL` → `XDAT` → `0x0D` `XBCH` → `FSSM` / `FSPX`), **RDNA 2 (GFX10.3) ISA decoder/disassembler** (`rdna2_isa.rs`), **RDNA 2 → SM 6.0 HLSL recompiler** (`rdna2_to_hlsl.rs` for VS/PS/CS), AMD GFX10 `T#`/`V#` descriptors, Xbox **BCPack MDU rANS** hardware texture decoder, deterministic **software DXR BVH** (`bvh.rs` + `XboxBvhBuilder.dll`), and Xbox **Frame Pacer**.
+- **Full GDK Runtime, `acphal.dll`, Xbox Middleware & Offline Networking (`crates/xsx-hle`)**:
+  - `xgameruntime.lib` dynamic bootstrap (`LoadLibraryW("xgameruntime.dll")` pseudo-handles + `InitializeApiImplEx2` + `QueryApiImpl` serving **10 COM API tables** with later-GDK IID aliases: `IXThreadingImpl`, `IXErrorImpl`, `IXNetworkingImpl2`, `XGame`, `XSystem`, `XUser` 37-slot + `XUserGamertag`, `XGameSave` 33-slot, `XPackage` 39-slot, `XGameRuntimeFeature`, `XGameEvent`).
+  - **`acphal.dll` / `xapu.dll`**: All 10 verified console audio HAL & APU/SHAPE heap exports (`ApuCreateHeap`, `ApuAlloc`/`Free`/`Map*`, `AcpHalAllocateShapeContexts`, `AcpHalCreate` + 8-slot `IAcpHal` COM channel with 128-sample/48 kHz frame ticks).
+  - **Middleware & Networking Shims**: `amd_fidelityfx_upscaler_xbox.dll` / `amd_fidelityfx_loader_xbox.dll` (wired straight into `xsx-d3d12`'s multithreaded **AMD FSR EASU + RCAS** upscaler), `bink2w64_scarlett.dll`, `XboxBvhBuilder.dll`, `pixevt.dll`, offline deterministic `xcurl.dll` & `libHttpClient.GDK.dll` (with mock rule registries), `xmem.dll`, `KeyboardGamepadMapper`, non-destructive `GAME:\` Copy-on-Write VFS overlay (`--overlay`), `--dry-run`, `--unimplemented <log|fail|stop>`, and crash-safe `--trace-jsonl`.
 
 ### AMD FSR Upscaling (Enabled by Default)
 

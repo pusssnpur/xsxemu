@@ -10,11 +10,14 @@
 //! - `xaudio2_9.dll` / `xaudio2_9redist.dll` (multi-voice stereo AudioMixer + Windows winmm playback + WAV export)
 //! - `dstorage_x.dll` / `dstorage_xs.dll` / `dstorage.dll`
 
+pub mod acphal;
 pub mod audio_mixer;
 pub mod d3d12_x;
 pub mod dstorage;
 pub mod input;
 pub mod kernelx;
+pub mod middleware;
+pub mod net;
 pub mod process;
 pub mod registry;
 pub mod rtc;
@@ -23,11 +26,12 @@ pub mod services;
 pub mod startup_trace;
 pub mod vfs;
 pub mod xaudio2;
+pub mod xg_xs;
 pub mod xgameruntime;
 pub mod xmem;
 
 pub use audio_mixer::{generate_sine_pcm16, AudioMixer};
-pub use input::VirtualGamepadState;
+pub use input::{KeyCode, KeyboardGamepadMapper, VirtualGamepadState};
 pub use process::{last_guest_exit_code, set_guest_command_line};
 pub use registry::{
     classify_import_return_class, get_unimplemented_policy, normalize_dll,
@@ -37,3 +41,4 @@ pub use rtc::RtcConfig;
 pub use runtime::{GuestRuntime, RuntimeGuard};
 pub use startup_trace::StartupTracer;
 pub use vfs::{VfsDirEntry, VirtualFs, XboxDrive};
+pub use xgameruntime::{get_active_title_id, set_active_title_id};

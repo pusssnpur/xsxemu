@@ -195,11 +195,11 @@ impl LoadedImage {
             }
         }
 
-        // 4. Resolve & patch Import Address Table (IAT)
+        // 4. Resolve & patch Import Address Table (IAT) for both eager and delay-load imports
         let mut resolved_imports = Vec::new();
         {
             let buf = memory.as_mut_slice();
-            for desc in &pe.imports {
+            for desc in pe.imports.iter().chain(pe.delay_imports.iter()) {
                 for entry in &desc.entries {
                     let Some((addr, is_stub)) = resolver.resolve(&desc.dll_name, &entry.symbol)
                     else {

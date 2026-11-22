@@ -24,6 +24,7 @@ pub const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 pub const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
 pub const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
 pub const IMAGE_DIRECTORY_ENTRY_IAT: usize = 12;
+pub const IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT: usize = 13;
 
 pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 pub const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
@@ -162,6 +163,7 @@ pub struct PeImage {
     pub data_directories: Vec<DataDirectory>,
     pub sections: Vec<SectionHeader>,
     pub imports: Vec<ImportDescriptor>,
+    pub delay_imports: Vec<ImportDescriptor>,
     pub exports: Option<ExportDirectory>,
     pub relocations: Vec<RelocBlock>,
     pub tls: Option<TlsDirectory>,
@@ -261,6 +263,7 @@ impl PeImage {
             data_directories,
             sections,
             imports: Vec::new(),
+            delay_imports: Vec::new(),
             exports: None,
             relocations: Vec::new(),
             tls: None,
@@ -269,6 +272,7 @@ impl PeImage {
         };
 
         image.imports = image.parse_imports()?;
+        image.delay_imports = image.parse_delay_imports()?;
         image.exports = image.parse_exports()?;
         image.relocations = image.parse_relocations()?;
         image.tls = image.parse_tls()?;
@@ -305,7 +309,7 @@ impl PeImage {
         Err(PeError::InvalidRva(rva))
     }
 
-    /// Detect whether this PE imports known Xbox Series X / GDK DLLs.
+    /// Detect whether this PE imports known Xbox Series X / GDK DLLs (eager or delay-load).
     pub fn xbox_dll_imports(&self) -> Vec<&str> {
         const KNOWN_XBOX_DLLS: &[&str] = &[
             "d3d12_x.dll",
@@ -314,12 +318,25 @@ impl PeImage {
             "kernelx.dll",
             "xuser.dll",
             "dstorage_x.dll",
+            "dstorage_xs.dll",
             "xcurl.dll",
             "xaudio2_9.dll",
+            "xaudio2_9redist.dll",
+            "xg_xs.dll",
+            "xg.dll",
+            "acphal.dll",
+            "xapu.dll",
+            "xmem.dll",
+            "pixevt.dll",
             "pixeventruntime.dll",
+            "amd_fidelityfx_upscaler_xbox.dll",
+            "amd_fidelityfx_loader_xbox.dll",
+            "bink2w64_scarlett.dll",
+            "xboxbvhbuilder.dll",
         ];
         self.imports
             .iter()
+            .chain(self.delay_imports.iter())
             .map(|d| d.dll_name.as_str())
             .filter(|name| {
                 let lower = name.to_ascii_lowercase();
@@ -336,6 +353,35 @@ impl PeImage {
             .position(|&b| b == 0)
             .ok_or(PeError::MalformedTable("unterminated C string"))?;
         Ok(String::from_utf8_lossy(&slice[..len]).into_owned())
+    }
+
+    fn parse_thunks(&self, lookup_rva: u32, iat_rva: u32) -> Result<Vec<ImportEntry>, PeError> {
+        let mut entries = Vec::new();
+        let mut idx = 0u32;
+        loop {
+            let thunk_rva = lookup_rva + idx * 8;
+            let thunk_off = self.rva_to_file_offset(thunk_rva)?;
+            let thunk_val = read_u64(&self.raw_bytes, thunk_off, "ImportThunk64")?;
+            if thunk_val == 0 {
+                break;
+            }
+            let slot_rva = iat_rva + idx * 8;
+            let symbol = if (thunk_val & (1u64 << 63)) != 0 {
+                ImportSymbol::Ordinal((thunk_val & 0xFFFF) as u16)
+            } else {
+                let hint_rva = (thunk_val & 0x7FFF_FFFF) as u32;
+                let hint_off = self.rva_to_file_offset(hint_rva)?;
+                let hint = read_u16(&self.raw_bytes, hint_off, "ImportHint")?;
+                let name = self.read_cstr_at_rva(hint_rva + 2)?;
+                ImportSymbol::Name { hint, name }
+            };
+            entries.push(ImportEntry {
+                symbol,
+                iat_rva: slot_rva,
+            });
+            idx += 1;
+        }
+        Ok(entries)
     }
 
     fn parse_imports(&self) -> Result<Vec<ImportDescriptor>, PeError> {
@@ -365,29 +411,7 @@ impl PeImage {
             } else {
                 first_thunk
             };
-
-            let mut entries = Vec::new();
-            let mut idx = 0u32;
-            loop {
-                let thunk_rva = lookup_rva + idx * 8;
-                let thunk_off = self.rva_to_file_offset(thunk_rva)?;
-                let thunk_val = read_u64(&self.raw_bytes, thunk_off, "ImportThunk64")?;
-                if thunk_val == 0 {
-                    break;
-                }
-                let iat_rva = first_thunk + idx * 8;
-                let symbol = if (thunk_val & (1u64 << 63)) != 0 {
-                    ImportSymbol::Ordinal((thunk_val & 0xFFFF) as u16)
-                } else {
-                    let hint_rva = (thunk_val & 0x7FFF_FFFF) as u32;
-                    let hint_off = self.rva_to_file_offset(hint_rva)?;
-                    let hint = read_u16(&self.raw_bytes, hint_off, "ImportHint")?;
-                    let name = self.read_cstr_at_rva(hint_rva + 2)?;
-                    ImportSymbol::Name { hint, name }
-                };
-                entries.push(ImportEntry { symbol, iat_rva });
-                idx += 1;
-            }
+            let entries = self.parse_thunks(lookup_rva, first_thunk)?;
 
             out.push(ImportDescriptor {
                 dll_name,
@@ -396,6 +420,54 @@ impl PeImage {
                 entries,
             });
             off += 20;
+        }
+        Ok(out)
+    }
+
+    fn parse_delay_imports(&self) -> Result<Vec<ImportDescriptor>, PeError> {
+        let Some(dir) = self.data_directory(IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) else {
+            return Ok(Vec::new());
+        };
+        let mut off = self.rva_to_file_offset(dir.virtual_address)?;
+        let mut out = Vec::new();
+
+        loop {
+            if off + 32 > self.raw_bytes.len() {
+                return Err(PeError::Truncated("DelayImportDescriptor"));
+            }
+            let attrs = read_u32(&self.raw_bytes, off, "DelayImport.Attrs")?;
+            let mut name_rva = read_u32(&self.raw_bytes, off + 4, "DelayImport.Name")?;
+            let _hmod_rva = read_u32(&self.raw_bytes, off + 8, "DelayImport.ModuleHandle")?;
+            let mut iat_rva = read_u32(&self.raw_bytes, off + 12, "DelayImport.IAT")?;
+            let mut int_rva = read_u32(&self.raw_bytes, off + 16, "DelayImport.INT")?;
+
+            if name_rva == 0 && iat_rva == 0 {
+                break;
+            }
+            // Bit 0 == 0 indicates legacy absolute VA fields; convert to RVA when possible.
+            if (attrs & 1) == 0 {
+                let to_rva = |v: u32| -> u32 {
+                    (v as u64)
+                        .checked_sub(self.image_base)
+                        .and_then(|r| u32::try_from(r).ok())
+                        .unwrap_or(v)
+                };
+                name_rva = to_rva(name_rva);
+                iat_rva = to_rva(iat_rva);
+                int_rva = to_rva(int_rva);
+            }
+
+            let dll_name = self.read_cstr_at_rva(name_rva)?;
+            let lookup_rva = if int_rva != 0 { int_rva } else { iat_rva };
+            let entries = self.parse_thunks(lookup_rva, iat_rva)?;
+
+            out.push(ImportDescriptor {
+                dll_name,
+                original_first_thunk: int_rva,
+                first_thunk: iat_rva,
+                entries,
+            });
+            off += 32;
         }
         Ok(out)
     }

@@ -40,8 +40,8 @@ impl LoadedModuleSet {
         let mut load_order: Vec<String> = Vec::new();
         let mut visiting: HashSet<String> = HashSet::new();
 
-        // Recursively load every non-HLE DLL imported by main_pe
-        for desc in &main_pe.imports {
+        // Recursively load every non-HLE DLL imported by main_pe (eager & delay-load)
+        for desc in main_pe.imports.iter().chain(main_pe.delay_imports.iter()) {
             let key = desc.dll_name.to_ascii_lowercase();
             if should_load_guest_dll(&desc.dll_name, &desc.entries, hle_resolver) {
                 load_guest_dll_recursive(

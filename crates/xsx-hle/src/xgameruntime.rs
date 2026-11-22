@@ -18,13 +18,16 @@ use core::ffi::{c_char, c_void};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use xsx_abi::com::{
-    Guid, HResult, CLSID_XERROR_IMPL, CLSID_XNETWORKING_IMPL, CLSID_XTHREADING_IMPL,
-    E_ABORT, E_INSUFFICIENT_BUFFER, E_INVALIDARG, E_NOINTERFACE, E_NOT_SUPPORTED, E_PENDING,
-    E_POINTER, IID_IUNKNOWN, S_OK,
+    Guid, HResult, CLSID_XERROR_IMPL, CLSID_XGAMEEVENT_API, CLSID_XGAMERUNTIME_FEATURE_API,
+    CLSID_XGAMESAVE_API, CLSID_XGAME_API, CLSID_XNETWORKING_IMPL, CLSID_XPACKAGE_API,
+    CLSID_XSYSTEM_API, CLSID_XTHREADING_IMPL, CLSID_XUSER_API, E_ABORT, E_INSUFFICIENT_BUFFER,
+    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_NOT_SUPPORTED, E_PENDING, E_POINTER,
+    IID_IUNKNOWN, IID_XGAMESAVE_LATER, IID_XGAME_LATER, IID_XPACKAGE_LATER, IID_XSYSTEM_LATER,
+    IID_XUSER_GAMERTAG, IID_XUSER_LATER, S_OK,
 };
 use xsx_abi::gdk::{
     ApiImplOptions, Handle, XAsyncBlock, XNetworkingConnectivityHint, XSystemAnalyticsInfo,
@@ -33,14 +36,30 @@ use xsx_abi::gdk::{
 
 use crate::registry::ModuleRegistry;
 use crate::runtime::{current_runtime, KernelObject};
+use crate::services;
 
 const CONSOLE_ID_STR: &[u8] = b"00000000.00000000.00000000.00000000.00\0";
+const SANDBOX_ID_STR: &[u8] = b"RETAIL\0";
+const USER_LOCALE_STR: &[u8] = b"en-US\0";
 const DEFAULT_PACKAGE_ID: &[u8] = b"XsxEmuPackageIdentifier000000000\0";
 
 static RUNTIME_REFS: AtomicI32 = AtomicI32::new(0);
 static API_REFS: AtomicI32 = AtomicI32::new(0);
 static NEXT_NET_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_USER_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_PKG_TOKEN: AtomicU64 = AtomicU64::new(1);
 static PROCESS_TASK_QUEUE: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_TITLE_ID: AtomicU32 = AtomicU32::new(0x7530_1234);
+
+/// Configure the active Xbox TitleId (typically loaded from `MicrosoftGame.Config`).
+pub fn set_active_title_id(title_id: u32) {
+    ACTIVE_TITLE_ID.store(title_id, Ordering::SeqCst);
+}
+
+/// Read the active Xbox TitleId reported by `XGameGetXboxTitleId`.
+pub fn get_active_title_id() -> u32 {
+    ACTIVE_TITLE_ID.load(Ordering::SeqCst)
+}
 
 thread_local! {
     static TIME_SENSITIVE: Cell<bool> = const { Cell::new(false) };
@@ -111,7 +130,7 @@ pub fn register(reg: &mut ModuleRegistry) {
         hle_query_api_impl as *const () as usize,
     );
 
-    // Core XGameRuntime & XSystem
+    // Core XGameRuntime, XGame, XSystem, Feature & Event
     reg.register_export(
         "xgameruntime.dll",
         "XGameRuntimeInitialize",
@@ -124,6 +143,21 @@ pub fn register(reg: &mut ModuleRegistry) {
     );
     reg.register_export(
         "xgameruntime.dll",
+        "XGameRuntimeIsFeatureAvailable",
+        hle_xgame_runtime_is_feature_available as *const () as usize,
+    );
+    reg.register_export(
+        "xgameruntime.dll",
+        "XGameGetXboxTitleId",
+        hle_xgame_get_xbox_title_id as *const () as usize,
+    );
+    reg.register_export(
+        "xgameruntime.dll",
+        "XGameEventWrite",
+        hle_xgame_event_write as *const () as usize,
+    );
+    reg.register_export(
+        "xgameruntime.dll",
         "XSystemGetDeviceType",
         hle_xsystem_get_device_type as *const () as usize,
     );
@@ -131,6 +165,11 @@ pub fn register(reg: &mut ModuleRegistry) {
         "xgameruntime.dll",
         "XSystemGetConsoleId",
         hle_xsystem_get_console_id as *const () as usize,
+    );
+    reg.register_export(
+        "xgameruntime.dll",
+        "XSystemGetXboxLiveSandboxId",
+        hle_xsystem_get_sandbox_id as *const () as usize,
     );
     reg.register_export(
         "xgameruntime.dll",
@@ -163,6 +202,16 @@ pub fn register(reg: &mut ModuleRegistry) {
         "xgameruntime.dll",
         "XPackageIsPackagedProcess",
         hle_xpackage_is_packaged_process as *const () as usize,
+    );
+    reg.register_export(
+        "xgameruntime.dll",
+        "XPackageGetUserLocale",
+        hle_xpackage_get_user_locale as *const () as usize,
+    );
+    reg.register_export(
+        "xgameruntime.dll",
+        "XPackageEnumeratePackages",
+        hle_xpackage_enumerate_packages as *const () as usize,
     );
 
     // XTaskQueue
@@ -317,6 +366,7 @@ unsafe impl Sync for ComSlot {}
 struct RuntimeSingleton {
     lp_vtbl: *const ComSlot,
     class_id: Guid,
+    alt_iid: Guid,
 }
 unsafe impl Sync for RuntimeSingleton {}
 
@@ -334,8 +384,11 @@ unsafe extern "win64" fn singleton_qi(
     }
     let obj = &*(this as *const RuntimeSingleton);
     let iid = *riid;
-    if iid == IID_IUNKNOWN || iid == obj.class_id {
+    if iid == IID_IUNKNOWN || iid == obj.class_id || iid == obj.alt_iid {
         *out = this;
+        S_OK
+    } else if obj.class_id == CLSID_XUSER_API && iid == IID_XUSER_GAMERTAG {
+        *out = &SINGLETON_USER_GAMERTAG as *const RuntimeSingleton as *mut c_void;
         S_OK
     } else {
         E_NOINTERFACE
@@ -647,17 +700,493 @@ static NETWORKING_VTBL: [ComSlot; 21] = [
     ComSlot(thr_stub_zero as *const c_void),              // 20
 ];
 
+// --- IXGameApiImpl (4 slots: slot 3 = XGameGetXboxTitleId) ---
+unsafe extern "win64" fn api_game_get_title_id(_this: *mut c_void, out: *mut u32) -> HResult {
+    hle_xgame_get_xbox_title_id(out)
+}
+static GAME_API_VTBL: [ComSlot; 4] = [
+    ComSlot(singleton_qi as *const c_void),
+    ComSlot(singleton_add_ref as *const c_void),
+    ComSlot(singleton_release as *const c_void),
+    ComSlot(api_game_get_title_id as *const c_void), // 3
+];
+
+// --- IXSystemApiImpl (5 slots: slot 3 = GetConsoleId, slot 4 = GetXboxLiveSandboxId) ---
+unsafe extern "win64" fn api_sys_get_console_id(
+    _this: *mut c_void,
+    size: usize,
+    buf: *mut u8,
+    used: *mut usize,
+) -> HResult {
+    hle_xsystem_get_console_id(size, buf, used)
+}
+unsafe extern "win64" fn api_sys_get_sandbox_id(
+    _this: *mut c_void,
+    size: usize,
+    buf: *mut u8,
+    used: *mut usize,
+) -> HResult {
+    hle_xsystem_get_sandbox_id(size, buf, used)
+}
+static SYSTEM_API_VTBL: [ComSlot; 5] = [
+    ComSlot(singleton_qi as *const c_void),
+    ComSlot(singleton_add_ref as *const c_void),
+    ComSlot(singleton_release as *const c_void),
+    ComSlot(api_sys_get_console_id as *const c_void), // 3
+    ComSlot(api_sys_get_sandbox_id as *const c_void), // 4
+];
+
+// --- IXUserApiImpl (37 slots) + IXUserGamertagImpl (4 slots) ---
+unsafe extern "win64" fn api_notimpl(_this: *mut c_void) -> HResult {
+    E_NOTIMPL
+}
+unsafe extern "win64" fn api_user_dup_handle(
+    _this: *mut c_void,
+    user: Handle,
+    dup: *mut Handle,
+) -> HResult {
+    if dup.is_null() {
+        return E_INVALIDARG;
+    }
+    *dup = user;
+    S_OK
+}
+unsafe extern "win64" fn api_user_close_handle(_this: *mut c_void, user: Handle) {
+    services::hle_xuser_close_handle(user);
+}
+unsafe extern "win64" fn api_user_compare(_this: *mut c_void, a: Handle, b: Handle) -> i32 {
+    if a == b { 0 } else if a < b { -1 } else { 1 }
+}
+unsafe extern "win64" fn api_user_get_max_users(_this: *mut c_void, out: *mut u32) -> HResult {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 4;
+    S_OK
+}
+unsafe extern "win64" fn api_user_add_async(
+    _this: *mut c_void,
+    options: u32,
+    ab: *mut xsx_abi::services::XAsyncBlock,
+) -> HResult {
+    services::hle_xuser_add_async(options, ab)
+}
+unsafe extern "win64" fn api_user_add_result(
+    _this: *mut c_void,
+    ab: *mut xsx_abi::services::XAsyncBlock,
+    out: *mut Handle,
+) -> HResult {
+    services::hle_xuser_add_result(ab, out)
+}
+unsafe extern "win64" fn api_user_get_local_id(
+    _this: *mut c_void,
+    _user: Handle,
+    out: *mut u64,
+) -> HResult {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 1;
+    S_OK
+}
+unsafe extern "win64" fn api_user_get_id(
+    _this: *mut c_void,
+    user: Handle,
+    out: *mut u64,
+) -> HResult {
+    services::hle_xuser_get_id(user, out)
+}
+unsafe extern "win64" fn api_user_get_is_guest(
+    _this: *mut c_void,
+    _user: Handle,
+    out: *mut bool,
+) -> HResult {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = false;
+    S_OK
+}
+unsafe extern "win64" fn api_user_get_state(
+    _this: *mut c_void,
+    _user: Handle,
+    out: *mut u32,
+) -> HResult {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 0; // XUserState::SignedIn
+    S_OK
+}
+unsafe extern "win64" fn api_user_get_gamertag_component(
+    _this: *mut c_void,
+    user: Handle,
+    component: u32,
+    size: usize,
+    buf: *mut c_char,
+    used: *mut usize,
+) -> HResult {
+    const MIN_BYTES: [usize; 4] = [16, 97, 15, 101];
+    if !used.is_null() {
+        *used = 0;
+    }
+    if component > 3 {
+        return E_INVALIDARG;
+    }
+    if size < MIN_BYTES[component as usize] {
+        return E_INSUFFICIENT_BUFFER;
+    }
+    services::hle_xuser_get_gamertag(user, component, size, buf, used)
+}
+unsafe extern "win64" fn api_user_get_gamertag_classic(
+    this: *mut c_void,
+    user: Handle,
+    size: usize,
+    buf: *mut c_char,
+    used: *mut usize,
+) -> HResult {
+    api_user_get_gamertag_component(this, user, 0, size, buf, used)
+}
+unsafe extern "win64" fn api_user_get_age_group(
+    _this: *mut c_void,
+    _user: Handle,
+    out: *mut u32,
+) -> HResult {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
+    *out = 3; // XUserAgeGroup::Adult
+    S_OK
+}
+unsafe extern "win64" fn api_user_check_privilege(
+    _this: *mut c_void,
+    _user: Handle,
+    _options: u32,
+    _privilege: u32,
+    has_priv: *mut bool,
+    reason: *mut u32,
+) -> HResult {
+    if !has_priv.is_null() {
+        *has_priv = true;
+    }
+    if !reason.is_null() {
+        *reason = 0;
+    }
+    S_OK
+}
+unsafe extern "win64" fn api_user_reg_change(
+    _this: *mut c_void,
+    _q: Handle,
+    _ctx: *mut c_void,
+    cb: *mut c_void,
+    token: *mut XTaskQueueRegistrationToken,
+) -> HResult {
+    if cb.is_null() || token.is_null() {
+        return E_INVALIDARG;
+    }
+    (*token).token = NEXT_USER_TOKEN.fetch_add(1, Ordering::Relaxed);
+    S_OK
+}
+unsafe extern "win64" fn api_user_unreg_change(
+    _this: *mut c_void,
+    token: XTaskQueueRegistrationToken,
+    _wait: bool,
+) -> bool {
+    token.token != 0
+}
+
+static USER_API_VTBL: [ComSlot; 37] = [
+    ComSlot(singleton_qi as *const c_void),               // 0
+    ComSlot(singleton_add_ref as *const c_void),          // 1
+    ComSlot(singleton_release as *const c_void),          // 2
+    ComSlot(api_user_dup_handle as *const c_void),        // 3
+    ComSlot(api_user_close_handle as *const c_void),      // 4
+    ComSlot(api_user_compare as *const c_void),           // 5
+    ComSlot(api_user_get_max_users as *const c_void),     // 6
+    ComSlot(api_user_add_async as *const c_void),         // 7
+    ComSlot(api_user_add_result as *const c_void),        // 8
+    ComSlot(api_user_get_local_id as *const c_void),      // 9
+    ComSlot(api_notimpl as *const c_void),                // 10
+    ComSlot(api_user_get_id as *const c_void),            // 11
+    ComSlot(api_notimpl as *const c_void),                // 12
+    ComSlot(api_user_get_is_guest as *const c_void),      // 13
+    ComSlot(api_user_get_state as *const c_void),         // 14
+    ComSlot(api_user_get_gamertag_classic as *const c_void), // 15
+    ComSlot(api_notimpl as *const c_void),                // 16
+    ComSlot(api_notimpl as *const c_void),                // 17
+    ComSlot(api_notimpl as *const c_void),                // 18
+    ComSlot(api_user_get_age_group as *const c_void),     // 19
+    ComSlot(api_user_check_privilege as *const c_void),   // 20
+    ComSlot(api_notimpl as *const c_void),                // 21
+    ComSlot(api_notimpl as *const c_void),                // 22
+    ComSlot(api_notimpl as *const c_void),                // 23
+    ComSlot(api_notimpl as *const c_void),                // 24
+    ComSlot(api_notimpl as *const c_void),                // 25
+    ComSlot(api_notimpl as *const c_void),                // 26
+    ComSlot(api_notimpl as *const c_void),                // 27
+    ComSlot(api_notimpl as *const c_void),                // 28
+    ComSlot(api_notimpl as *const c_void),                // 29
+    ComSlot(api_notimpl as *const c_void),                // 30
+    ComSlot(api_notimpl as *const c_void),                // 31
+    ComSlot(api_notimpl as *const c_void),                // 32
+    ComSlot(api_user_reg_change as *const c_void),        // 33
+    ComSlot(api_user_unreg_change as *const c_void),      // 34
+    ComSlot(api_notimpl as *const c_void),                // 35
+    ComSlot(api_notimpl as *const c_void),                // 36
+];
+
+static USER_GAMERTAG_VTBL: [ComSlot; 4] = [
+    ComSlot(singleton_qi as *const c_void),
+    ComSlot(singleton_add_ref as *const c_void),
+    ComSlot(singleton_release as *const c_void),
+    ComSlot(api_user_get_gamertag_component as *const c_void), // 3
+];
+
+// --- IXGameSaveApiImpl (33 slots) ---
+unsafe extern "win64" fn api_save_init_provider(
+    _this: *mut c_void,
+    user: Handle,
+    scid: *const c_char,
+    sync: i32,
+    out: *mut Handle,
+) -> HResult {
+    services::hle_xgamesave_init_provider(user, scid, sync, out)
+}
+unsafe extern "win64" fn api_save_close(_this: *mut c_void, h: Handle) {
+    services::hle_xgamesave_close_handle(h);
+}
+unsafe extern "win64" fn api_save_remaining_quota(
+    _this: *mut c_void,
+    _provider: Handle,
+    quota: *mut i64,
+) -> HResult {
+    if quota.is_null() {
+        return E_INVALIDARG;
+    }
+    *quota = 256 * 1024 * 1024;
+    S_OK
+}
+unsafe extern "win64" fn api_save_create_container(
+    _this: *mut c_void,
+    provider: Handle,
+    name: *const c_char,
+    out: *mut Handle,
+) -> HResult {
+    services::hle_xgamesave_create_container(provider, name, out)
+}
+unsafe extern "win64" fn api_save_create_update(
+    _this: *mut c_void,
+    container: Handle,
+    display_name: *const c_char,
+    out: *mut Handle,
+) -> HResult {
+    services::hle_xgamesave_create_update(container, display_name, out)
+}
+unsafe extern "win64" fn api_save_submit_blob_write(
+    _this: *mut c_void,
+    update: Handle,
+    name: *const c_char,
+    data: *const u8,
+    count: usize,
+) -> HResult {
+    services::hle_xgamesave_submit_blob_write(update, name, data, count)
+}
+unsafe extern "win64" fn api_save_submit_update(_this: *mut c_void, update: Handle) -> HResult {
+    services::hle_xgamesave_submit_update(update)
+}
+
+static GAMESAVE_API_VTBL: [ComSlot; 33] = [
+    ComSlot(singleton_qi as *const c_void),               // 0
+    ComSlot(singleton_add_ref as *const c_void),          // 1
+    ComSlot(singleton_release as *const c_void),          // 2
+    ComSlot(api_save_init_provider as *const c_void),     // 3
+    ComSlot(api_notimpl as *const c_void),                // 4
+    ComSlot(api_notimpl as *const c_void),                // 5
+    ComSlot(api_save_close as *const c_void),             // 6
+    ComSlot(api_save_remaining_quota as *const c_void),   // 7
+    ComSlot(api_notimpl as *const c_void),                // 8
+    ComSlot(api_notimpl as *const c_void),                // 9
+    ComSlot(api_notimpl as *const c_void),                // 10
+    ComSlot(api_notimpl as *const c_void),                // 11
+    ComSlot(api_notimpl as *const c_void),                // 12
+    ComSlot(api_notimpl as *const c_void),                // 13
+    ComSlot(api_notimpl as *const c_void),                // 14
+    ComSlot(api_notimpl as *const c_void),                // 15
+    ComSlot(api_save_create_container as *const c_void),  // 16
+    ComSlot(api_save_close as *const c_void),             // 17
+    ComSlot(api_notimpl as *const c_void),                // 18
+    ComSlot(api_notimpl as *const c_void),                // 19
+    ComSlot(api_notimpl as *const c_void),                // 20
+    ComSlot(api_notimpl as *const c_void),                // 21
+    ComSlot(api_notimpl as *const c_void),                // 22
+    ComSlot(api_save_create_update as *const c_void),     // 23
+    ComSlot(api_save_close as *const c_void),             // 24
+    ComSlot(api_save_submit_blob_write as *const c_void), // 25
+    ComSlot(api_notimpl as *const c_void),                // 26
+    ComSlot(api_save_submit_update as *const c_void),     // 27
+    ComSlot(api_notimpl as *const c_void),                // 28
+    ComSlot(api_notimpl as *const c_void),                // 29
+    ComSlot(api_notimpl as *const c_void),                // 30
+    ComSlot(api_notimpl as *const c_void),                // 31
+    ComSlot(api_save_remaining_quota as *const c_void),   // 32
+];
+
+// --- IXPackageApiImpl (39 slots) ---
+unsafe extern "win64" fn api_pkg_get_user_locale(
+    _this: *mut c_void,
+    size: usize,
+    buf: *mut c_char,
+) -> HResult {
+    hle_xpackage_get_user_locale(size, buf)
+}
+unsafe extern "win64" fn api_pkg_enumerate(
+    _this: *mut c_void,
+    kind: u32,
+    scope: u32,
+    ctx: *mut c_void,
+    cb: *mut c_void,
+) -> HResult {
+    hle_xpackage_enumerate_packages(kind, scope, ctx, cb)
+}
+unsafe extern "win64" fn api_pkg_reg_installed(
+    _this: *mut c_void,
+    _q: Handle,
+    _ctx: *mut c_void,
+    cb: *mut c_void,
+    token: *mut XTaskQueueRegistrationToken,
+) -> HResult {
+    if cb.is_null() || token.is_null() {
+        return E_INVALIDARG;
+    }
+    (*token).token = NEXT_PKG_TOKEN.fetch_add(1, Ordering::Relaxed);
+    S_OK
+}
+
+static PACKAGE_API_VTBL: [ComSlot; 39] = [
+    ComSlot(singleton_qi as *const c_void),            // 0
+    ComSlot(singleton_add_ref as *const c_void),       // 1
+    ComSlot(singleton_release as *const c_void),       // 2
+    ComSlot(api_notimpl as *const c_void),             // 3
+    ComSlot(api_notimpl as *const c_void),             // 4
+    ComSlot(api_notimpl as *const c_void),             // 5
+    ComSlot(api_notimpl as *const c_void),             // 6
+    ComSlot(api_notimpl as *const c_void),             // 7
+    ComSlot(api_notimpl as *const c_void),             // 8
+    ComSlot(api_notimpl as *const c_void),             // 9
+    ComSlot(api_notimpl as *const c_void),             // 10
+    ComSlot(api_pkg_get_user_locale as *const c_void), // 11
+    ComSlot(api_notimpl as *const c_void),             // 12
+    ComSlot(api_notimpl as *const c_void),             // 13
+    ComSlot(api_notimpl as *const c_void),             // 14
+    ComSlot(api_notimpl as *const c_void),             // 15
+    ComSlot(api_notimpl as *const c_void),             // 16
+    ComSlot(api_notimpl as *const c_void),             // 17
+    ComSlot(api_notimpl as *const c_void),             // 18
+    ComSlot(api_notimpl as *const c_void),             // 19
+    ComSlot(api_pkg_enumerate as *const c_void),       // 20
+    ComSlot(api_pkg_reg_installed as *const c_void),   // 21
+    ComSlot(api_notimpl as *const c_void),             // 22
+    ComSlot(api_notimpl as *const c_void),             // 23
+    ComSlot(api_notimpl as *const c_void),             // 24
+    ComSlot(api_notimpl as *const c_void),             // 25
+    ComSlot(api_notimpl as *const c_void),             // 26
+    ComSlot(api_notimpl as *const c_void),             // 27
+    ComSlot(api_pkg_enumerate as *const c_void),       // 28
+    ComSlot(api_pkg_reg_installed as *const c_void),   // 29
+    ComSlot(api_notimpl as *const c_void),             // 30
+    ComSlot(api_notimpl as *const c_void),             // 31
+    ComSlot(api_notimpl as *const c_void),             // 32
+    ComSlot(api_notimpl as *const c_void),             // 33
+    ComSlot(api_notimpl as *const c_void),             // 34
+    ComSlot(api_pkg_enumerate as *const c_void),       // 35
+    ComSlot(api_pkg_reg_installed as *const c_void),   // 36
+    ComSlot(api_notimpl as *const c_void),             // 37
+    ComSlot(api_notimpl as *const c_void),             // 38
+];
+
+// --- IXGameRuntimeFeatureImpl (4 slots) & IXGameEventImpl (4 slots) ---
+unsafe extern "win64" fn api_feature_is_available(_this: *mut c_void, feature: u32) -> bool {
+    hle_xgame_runtime_is_feature_available(feature)
+}
+static FEATURE_API_VTBL: [ComSlot; 4] = [
+    ComSlot(singleton_qi as *const c_void),
+    ComSlot(singleton_add_ref as *const c_void),
+    ComSlot(singleton_release as *const c_void),
+    ComSlot(api_feature_is_available as *const c_void), // 3
+];
+
+unsafe extern "win64" fn api_event_write(
+    _this: *mut c_void,
+    user: Handle,
+    scid: *const c_char,
+    session_id: *const c_char,
+    event_name: *const c_char,
+    dims: *const c_char,
+    meas: *const c_char,
+) -> HResult {
+    hle_xgame_event_write(user, scid, session_id, event_name, dims, meas)
+}
+static GAMEEVENT_API_VTBL: [ComSlot; 4] = [
+    ComSlot(singleton_qi as *const c_void),
+    ComSlot(singleton_add_ref as *const c_void),
+    ComSlot(singleton_release as *const c_void),
+    ComSlot(api_event_write as *const c_void), // 3
+];
+
 static SINGLETON_THREADING: RuntimeSingleton = RuntimeSingleton {
     lp_vtbl: THREADING_VTBL.as_ptr(),
     class_id: CLSID_XTHREADING_IMPL,
+    alt_iid: CLSID_XTHREADING_IMPL,
 };
 static SINGLETON_ERROR: RuntimeSingleton = RuntimeSingleton {
     lp_vtbl: ERROR_VTBL.as_ptr(),
     class_id: CLSID_XERROR_IMPL,
+    alt_iid: CLSID_XERROR_IMPL,
 };
 static SINGLETON_NETWORKING: RuntimeSingleton = RuntimeSingleton {
     lp_vtbl: NETWORKING_VTBL.as_ptr(),
     class_id: CLSID_XNETWORKING_IMPL,
+    alt_iid: CLSID_XNETWORKING_IMPL,
+};
+static SINGLETON_GAME: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: GAME_API_VTBL.as_ptr(),
+    class_id: CLSID_XGAME_API,
+    alt_iid: IID_XGAME_LATER,
+};
+static SINGLETON_SYSTEM: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: SYSTEM_API_VTBL.as_ptr(),
+    class_id: CLSID_XSYSTEM_API,
+    alt_iid: IID_XSYSTEM_LATER,
+};
+static SINGLETON_USER: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: USER_API_VTBL.as_ptr(),
+    class_id: CLSID_XUSER_API,
+    alt_iid: IID_XUSER_LATER,
+};
+static SINGLETON_USER_GAMERTAG: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: USER_GAMERTAG_VTBL.as_ptr(),
+    class_id: IID_XUSER_GAMERTAG,
+    alt_iid: IID_XUSER_GAMERTAG,
+};
+static SINGLETON_GAMESAVE: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: GAMESAVE_API_VTBL.as_ptr(),
+    class_id: CLSID_XGAMESAVE_API,
+    alt_iid: IID_XGAMESAVE_LATER,
+};
+static SINGLETON_PACKAGE: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: PACKAGE_API_VTBL.as_ptr(),
+    class_id: CLSID_XPACKAGE_API,
+    alt_iid: IID_XPACKAGE_LATER,
+};
+static SINGLETON_FEATURE: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: FEATURE_API_VTBL.as_ptr(),
+    class_id: CLSID_XGAMERUNTIME_FEATURE_API,
+    alt_iid: CLSID_XGAMERUNTIME_FEATURE_API,
+};
+static SINGLETON_GAMEEVENT: RuntimeSingleton = RuntimeSingleton {
+    lp_vtbl: GAMEEVENT_API_VTBL.as_ptr(),
+    class_id: CLSID_XGAMEEVENT_API,
+    alt_iid: CLSID_XGAMEEVENT_API,
 };
 
 unsafe extern "win64" fn hle_query_api_impl(
@@ -678,6 +1207,20 @@ unsafe extern "win64" fn hle_query_api_impl(
         Some(&SINGLETON_ERROR)
     } else if cid == CLSID_XNETWORKING_IMPL {
         Some(&SINGLETON_NETWORKING)
+    } else if cid == CLSID_XGAME_API {
+        Some(&SINGLETON_GAME)
+    } else if cid == CLSID_XSYSTEM_API {
+        Some(&SINGLETON_SYSTEM)
+    } else if cid == CLSID_XUSER_API {
+        Some(&SINGLETON_USER)
+    } else if cid == CLSID_XGAMESAVE_API {
+        Some(&SINGLETON_GAMESAVE)
+    } else if cid == CLSID_XPACKAGE_API {
+        Some(&SINGLETON_PACKAGE)
+    } else if cid == CLSID_XGAMERUNTIME_FEATURE_API {
+        Some(&SINGLETON_FEATURE)
+    } else if cid == CLSID_XGAMEEVENT_API {
+        Some(&SINGLETON_GAMEEVENT)
     } else {
         None
     };
@@ -695,8 +1238,79 @@ unsafe extern "win64" fn hle_query_api_impl(
 }
 
 // ---------------------------------------------------------------------------
-// Core XGameRuntime / XSystem / XPackage
+// Core XGameRuntime / XGame / XSystem / XPackage
 // ---------------------------------------------------------------------------
+
+unsafe extern "win64" fn hle_xgame_get_xbox_title_id(title_id: *mut u32) -> HResult {
+    if title_id.is_null() {
+        return E_INVALIDARG;
+    }
+    let tid = get_active_title_id();
+    *title_id = tid;
+    if let Some(rt) = current_runtime() {
+        rt.trace(format!("xgameruntime!XGameGetXboxTitleId() -> 0x{tid:08X}"));
+    }
+    S_OK
+}
+
+unsafe extern "win64" fn hle_xgame_runtime_is_feature_available(feature: u32) -> bool {
+    feature <= 21
+}
+
+unsafe extern "win64" fn hle_xgame_event_write(
+    user: Handle,
+    _scid: *const c_char,
+    _session_id: *const c_char,
+    event_name: *const c_char,
+    _dims: *const c_char,
+    _meas: *const c_char,
+) -> HResult {
+    if user.is_null() || event_name.is_null() {
+        return E_INVALIDARG;
+    }
+    S_OK
+}
+
+unsafe extern "win64" fn hle_xsystem_get_sandbox_id(
+    size: usize,
+    out: *mut u8,
+    used: *mut usize,
+) -> HResult {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if size < SANDBOX_ID_STR.len() {
+        return E_INSUFFICIENT_BUFFER;
+    }
+    core::ptr::copy_nonoverlapping(SANDBOX_ID_STR.as_ptr(), out, SANDBOX_ID_STR.len());
+    if !used.is_null() {
+        *used = SANDBOX_ID_STR.len();
+    }
+    S_OK
+}
+
+unsafe extern "win64" fn hle_xpackage_get_user_locale(
+    size: usize,
+    out: *mut c_char,
+) -> HResult {
+    if out.is_null() || size < USER_LOCALE_STR.len() {
+        return E_INSUFFICIENT_BUFFER;
+    }
+    core::ptr::copy_nonoverlapping(USER_LOCALE_STR.as_ptr(), out as *mut u8, USER_LOCALE_STR.len());
+    S_OK
+}
+
+unsafe extern "win64" fn hle_xpackage_enumerate_packages(
+    _kind: u32,
+    _scope: u32,
+    _ctx: *mut c_void,
+    callback: *mut c_void,
+) -> HResult {
+    if callback.is_null() {
+        return E_INVALIDARG;
+    }
+    S_OK
+}
 
 unsafe extern "win64" fn hle_xgame_runtime_initialize() -> HResult {
     RUNTIME_REFS.fetch_add(1, Ordering::Relaxed);

@@ -21,6 +21,7 @@ use crate::runtime::{current_runtime, GuestRuntime};
 pub fn register(reg: &mut ModuleRegistry) {
     for dll in ["xaudio2_9.dll", "xaudio2_9redist.dll"] {
         reg.register_export(dll, "XAudio2Create", hle_xaudio2_create as *const () as usize);
+        reg.register_ordinal(dll, 1, hle_xaudio2_create as *const () as usize);
     }
 }
 

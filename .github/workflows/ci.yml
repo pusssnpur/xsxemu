@@ -42,3 +42,6 @@ jobs:
           cargo run -p xsxemu -- gen-realgame realgame_out
           cargo run -p xsxemu -- run realgame_out/realgame_xsx.exe --dry-run --trace-jsonl realgame_dry.jsonl
           test -s realgame_dry.jsonl
+          printf '<Game configVersion="1"><Identity Name="CiBoot"/><TitleId>7A5F9999</TitleId><ExecutableList><Executable Name="realgame_xsx.exe" TargetDeviceFamily="XboxGen9"/></ExecutableList></Game>\n' > realgame_out/MicrosoftGame.Config
+          cargo run -p xsxemu -- boot realgame_out --dry-run
+
