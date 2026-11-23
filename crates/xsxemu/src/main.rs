@@ -75,8 +75,7 @@ fn print_usage() {
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        print_usage();
-        return ExitCode::from(2);
+        return cmd_gui(&[]);
     }
 
     match args[0].as_str() {
@@ -117,6 +116,7 @@ fn cmd_gui(args: &[String]) -> ExitCode {
                 i += 1;
                 if let Some(p) = args.get(i).and_then(|s| s.parse::<u16>().ok()) {
                     opts.port = p;
+                    opts.port_pinned = true;
                 } else {
                     eprintln!("--port requires a valid TCP port (0..=65535)");
                     return ExitCode::from(2);

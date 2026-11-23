@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -36,6 +36,7 @@ const WEB_HTML: &str = include_str!("gui_web.html");
 pub struct GuiOptions {
     pub web_only: bool,
     pub port: u16,
+    pub port_pinned: bool,
     pub open_browser: bool,
 }
 
@@ -44,6 +45,7 @@ impl Default for GuiOptions {
         Self {
             web_only: false,
             port: 8080,
+            port_pinned: false,
             open_browser: true,
         }
     }
@@ -57,10 +59,14 @@ pub fn launch_gui(opts: GuiOptions) -> io::Result<()> {
     }
 
     let addr = format!("127.0.0.1:{}", opts.port);
-    let server = GuiServer::bind(&addr)?;
+    let server = match GuiServer::bind(&addr) {
+        Ok(s) => s,
+        Err(_) if !opts.port_pinned => GuiServer::bind("127.0.0.1:0")?,
+        Err(e) => return Err(e),
+    };
     let bound = server.addr();
     let url = format!("http://{bound}/");
-    println!("xsxemu Web GUI listening at {url}");
+    println!("xsxemu Web GUI listening at {url} (press Ctrl+C to stop)");
     if opts.open_browser {
         open_in_browser(&url);
     }
@@ -71,15 +77,42 @@ pub fn launch_gui(opts: GuiOptions) -> io::Result<()> {
 fn open_in_browser(url: &str) {
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg(url).spawn();
+        let _ = Command::new("open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = Command::new("xdg-open").arg(url).spawn();
+        for (prog, prefix) in [
+            ("xdg-open", &[][..]),
+            ("gio", &["open"][..]),
+            ("sensible-browser", &[][..]),
+            ("firefox", &[][..]),
+            ("chromium", &[][..]),
+            ("google-chrome", &[][..]),
+        ] {
+            let mut cmd = Command::new(prog);
+            cmd.args(prefix)
+                .arg(url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if cmd.spawn().is_ok() {
+                break;
+            }
+        }
     }
 }
 
