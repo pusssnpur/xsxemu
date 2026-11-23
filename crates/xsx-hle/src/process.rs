@@ -113,6 +113,10 @@ pub fn last_guest_exit_code() -> Option<i32> {
     process_state().lock().unwrap().exit_code
 }
 
+pub fn record_guest_exit(code: i32) {
+    process_state().lock().unwrap().exit_code = Some(code);
+}
+
 pub fn register(reg: &mut ModuleRegistry) {
     // Command line (kernelx / kernel32 / kernelbase / api-ms-win-core-processenvironment)
     reg.register_export(

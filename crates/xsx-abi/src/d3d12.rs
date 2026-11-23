@@ -206,6 +206,15 @@ pub struct D3D12VertexBufferView {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
+pub struct D3D12IndexBufferView {
+    pub buffer_location: u64,
+    pub size_in_bytes: u32,
+    /// `57` = `DXGI_FORMAT_R16_UINT`, `42` = `DXGI_FORMAT_R32_UINT`.
+    pub format: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct D3D12Range {
     pub begin: usize,
     pub end: usize,
@@ -558,6 +567,20 @@ pub struct ID3D12GraphicsCommandListXVtbl {
         p_dst_resource: *mut c_void,
         p_src_resource: *mut c_void,
     ),
+    // Slot 18 (IASetIndexBuffer)
+    pub ia_set_index_buffer: unsafe extern "win64" fn(
+        this: *mut c_void,
+        p_view: *const D3D12IndexBufferView,
+    ),
+    // Slot 19 (DrawIndexedInstanced)
+    pub draw_indexed_instanced: unsafe extern "win64" fn(
+        this: *mut c_void,
+        index_count_per_instance: u32,
+        instance_count: u32,
+        start_index_location: u32,
+        base_vertex_location: i32,
+        start_instance_location: u32,
+    ),
 }
 
 #[repr(C)]
@@ -711,6 +734,7 @@ mod tests {
         assert_eq!(size_of::<D3D12Viewport>(), 24);
         assert_eq!(size_of::<D3D12Rect>(), 16);
         assert_eq!(size_of::<D3D12VertexBufferView>(), 16);
+        assert_eq!(size_of::<D3D12IndexBufferView>(), 16);
         assert_eq!(size_of::<D3D12CpuDescriptorHandle>(), 8);
         assert_eq!(size_of::<SimpleVertex>(), 28);
         assert_eq!(size_of::<DxgiSwapChainDesc1>(), 48);

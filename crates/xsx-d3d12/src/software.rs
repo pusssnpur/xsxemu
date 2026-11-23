@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 
 use xsx_abi::d3d12::{
-    D3D12HeapProperties, D3D12Rect, D3D12ResourceDesc, D3D12ResourceDimension,
-    D3D12VertexBufferView, D3D12Viewport, D3DPrimitiveTopology, SimpleVertex,
+    D3D12HeapProperties, D3D12IndexBufferView, D3D12Rect, D3D12ResourceDesc,
+    D3D12ResourceDimension, D3D12VertexBufferView, D3D12Viewport, D3DPrimitiveTopology, SimpleVertex,
 };
 
 use crate::backend::{GpuBackend, GpuCommand, PresentedFrame};
@@ -18,6 +18,7 @@ struct SoftResource {
     height: u32,
     /// Heap-allocated backing store with stable address for `Map` / `GetGPUVirtualAddress`.
     data: Box<[u8]>,
+    depth: Vec<f32>,
 }
 
 pub struct SoftwareD3D12Backend {
@@ -33,6 +34,7 @@ pub struct SoftwareD3D12Backend {
     scissor: Option<D3D12Rect>,
     topology: u32,
     vertex_buffers: HashMap<u32, D3D12VertexBufferView>,
+    index_buffer: Option<D3D12IndexBufferView>,
 }
 
 impl SoftwareD3D12Backend {
@@ -55,6 +57,7 @@ impl SoftwareD3D12Backend {
             scissor: None,
             topology: D3DPrimitiveTopology::TriangleList as u32,
             vertex_buffers: HashMap::new(),
+            index_buffer: None,
         }
     }
 
@@ -83,6 +86,7 @@ impl SoftwareD3D12Backend {
             for px in res.data.chunks_exact_mut(4) {
                 px.copy_from_slice(&rgba);
             }
+            res.depth.fill(1.0);
         } else {
             let w = res.width as i32;
             let h = res.height as i32;
@@ -93,8 +97,9 @@ impl SoftwareD3D12Backend {
                 let y1 = r.bottom.clamp(0, h);
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        let idx = ((y as u32 * res.width + x as u32) * 4) as usize;
-                        res.data[idx..idx + 4].copy_from_slice(&rgba);
+                        let p = (y as u32 * res.width + x as u32) as usize;
+                        res.data[p * 4..p * 4 + 4].copy_from_slice(&rgba);
+                        res.depth[p] = 1.0;
                     }
                 }
             }
@@ -102,7 +107,7 @@ impl SoftwareD3D12Backend {
     }
 
     fn draw_instanced(&mut self, vertex_count: u32, start_vertex: u32) {
-        if self.topology != D3DPrimitiveTopology::TriangleList as u32 {
+        if !matches!(self.topology, 4 | 5) {
             return;
         }
         let Some(rtv_handle) = self.bound_rtv else {
@@ -119,7 +124,6 @@ impl SoftwareD3D12Backend {
             return;
         }
 
-        // Read vertices from the guest/resource memory at vb.buffer_location
         let stride = vb.stride_in_bytes as usize;
         let max_verts = (vb.size_in_bytes as usize) / stride;
         let end_vert = ((start_vertex.saturating_add(vertex_count)) as usize).min(max_verts);
@@ -131,23 +135,80 @@ impl SoftwareD3D12Backend {
         let mut vertices = Vec::with_capacity(end_vert - start);
         for i in start..end_vert {
             let ptr = (vb.buffer_location as usize + i * stride) as *const SimpleVertex;
-            // Safety: caller bound a valid mapped buffer or guest .rdata vertex array.
             let v = unsafe { ptr.read_unaligned() };
             vertices.push(v);
         }
 
         let vp = self.viewport;
         let scissor = self.scissor;
+        let topo = self.topology;
         let Some(res) = self.resources.get_mut(&res_id) else {
             return;
         };
         if !res.is_texture {
             return;
         }
+        rasterize_primitive_stream(res, vp, scissor, topo, &vertices);
+    }
 
-        for tri in vertices.chunks_exact(3) {
-            rasterize_triangle(res, vp, scissor, tri[0], tri[1], tri[2]);
+    fn draw_indexed_instanced(&mut self, index_count: u32, start_index: u32, base_vertex: i32) {
+        if !matches!(self.topology, 4 | 5) {
+            return;
         }
+        let Some(rtv_handle) = self.bound_rtv else {
+            return;
+        };
+        let Some(res_id) = self.resolve_rtv_resource(rtv_handle) else {
+            return;
+        };
+        let Some(vb) = self.vertex_buffers.get(&0).copied() else {
+            return;
+        };
+        let Some(ib) = self.index_buffer else {
+            return;
+        };
+        if vb.buffer_location == 0
+            || ib.buffer_location == 0
+            || vb.stride_in_bytes < core::mem::size_of::<SimpleVertex>() as u32
+        {
+            return;
+        }
+
+        let idx_bytes = if ib.format == 42 { 4usize } else { 2usize }; // R32_UINT vs R16_UINT
+        let max_indices = (ib.size_in_bytes as usize) / idx_bytes;
+        let end_idx = ((start_index.saturating_add(index_count)) as usize).min(max_indices);
+        let start_idx = start_index as usize;
+        if end_idx <= start_idx {
+            return;
+        }
+
+        let stride = vb.stride_in_bytes as usize;
+        let max_verts = (vb.size_in_bytes as usize) / stride;
+        let mut vertices = Vec::with_capacity(end_idx - start_idx);
+        for ii in start_idx..end_idx {
+            let raw_idx = if idx_bytes == 4 {
+                unsafe { *((ib.buffer_location as usize + ii * 4) as *const u32) as i64 }
+            } else {
+                unsafe { *((ib.buffer_location as usize + ii * 2) as *const u16) as i64 }
+            };
+            let v_idx = raw_idx + base_vertex as i64;
+            if v_idx < 0 || (v_idx as usize) >= max_verts {
+                continue;
+            }
+            let ptr = (vb.buffer_location as usize + (v_idx as usize) * stride) as *const SimpleVertex;
+            vertices.push(unsafe { ptr.read_unaligned() });
+        }
+
+        let vp = self.viewport;
+        let scissor = self.scissor;
+        let topo = self.topology;
+        let Some(res) = self.resources.get_mut(&res_id) else {
+            return;
+        };
+        if !res.is_texture {
+            return;
+        }
+        rasterize_primitive_stream(res, vp, scissor, topo, &vertices);
     }
 }
 
@@ -175,6 +236,11 @@ impl GpuBackend for SoftwareD3D12Backend {
         };
 
         let data = vec![0u8; byte_len].into_boxed_slice();
+        let depth = if is_texture {
+            vec![1.0_f32; (width as usize) * (height as usize)]
+        } else {
+            Vec::new()
+        };
         let gpu_va = data.as_ptr() as u64;
         self.resources.insert(
             id,
@@ -183,6 +249,7 @@ impl GpuBackend for SoftwareD3D12Backend {
                 width,
                 height,
                 data,
+                depth,
             },
         );
         Ok(gpu_va)
@@ -223,11 +290,20 @@ impl GpuBackend for SoftwareD3D12Backend {
                 GpuCommand::SetVertexBuffer { slot, view } => {
                     self.vertex_buffers.insert(*slot, *view);
                 }
+                GpuCommand::SetIndexBuffer { view } => {
+                    self.index_buffer = Some(*view);
+                }
                 GpuCommand::DrawInstanced {
                     vertex_count,
                     start_vertex,
                     ..
                 } => self.draw_instanced(*vertex_count, *start_vertex),
+                GpuCommand::DrawIndexedInstanced {
+                    index_count,
+                    start_index,
+                    base_vertex,
+                    ..
+                } => self.draw_indexed_instanced(*index_count, *start_index, *base_vertex),
                 GpuCommand::SetPipelineState { .. }
                 | GpuCommand::SetGraphicsRootSignature { .. }
                 | GpuCommand::SetComputeRootSignature { .. }
@@ -284,6 +360,29 @@ fn ndc_to_screen(pos: [f32; 3], vp: D3D12Viewport) -> (f32, f32) {
 
 fn edge_fn(ax: f32, ay: f32, bx: f32, by: f32, px: f32, py: f32) -> f32 {
     (px - ax) * (by - ay) - (py - ay) * (bx - ax)
+}
+
+fn rasterize_primitive_stream(
+    res: &mut SoftResource,
+    vp: D3D12Viewport,
+    scissor: Option<D3D12Rect>,
+    topology: u32,
+    vertices: &[SimpleVertex],
+) {
+    if topology == 5 {
+        // D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+        for i in 0..vertices.len().saturating_sub(2) {
+            if i % 2 == 0 {
+                rasterize_triangle(res, vp, scissor, vertices[i], vertices[i + 1], vertices[i + 2]);
+            } else {
+                rasterize_triangle(res, vp, scissor, vertices[i + 1], vertices[i], vertices[i + 2]);
+            }
+        }
+    } else {
+        for tri in vertices.chunks_exact(3) {
+            rasterize_triangle(res, vp, scissor, tri[0], tri[1], tri[2]);
+        }
+    }
 }
 
 fn rasterize_triangle(
@@ -343,15 +442,28 @@ fn rasterize_triangle(
                 let b0 = w0 * inv_area;
                 let b1 = w1 * inv_area;
                 let b2 = w2 * inv_area;
-                let r = b0 * v0.color[0] + b1 * v1.color[0] + b2 * v2.color[0];
-                let g = b0 * v0.color[1] + b1 * v1.color[1] + b2 * v2.color[1];
-                let b = b0 * v0.color[2] + b1 * v1.color[2] + b2 * v2.color[2];
-                let a = b0 * v0.color[3] + b1 * v1.color[3] + b2 * v2.color[3];
-                let idx = (row_off + x as usize) * 4;
-                res.data[idx] = float_to_u8(r);
-                res.data[idx + 1] = float_to_u8(g);
-                res.data[idx + 2] = float_to_u8(b);
-                res.data[idx + 3] = float_to_u8(a);
+                let z = (b0 * v0.pos[2] + b1 * v1.pos[2] + b2 * v2.pos[2]).clamp(0.0, 1.0);
+                let p = row_off + x as usize;
+                if z <= res.depth[p] {
+                    let a = (b0 * v0.color[3] + b1 * v1.color[3] + b2 * v2.color[3]).clamp(0.0, 1.0);
+                    let r = b0 * v0.color[0] + b1 * v1.color[0] + b2 * v2.color[0];
+                    let g = b0 * v0.color[1] + b1 * v1.color[1] + b2 * v2.color[1];
+                    let b = b0 * v0.color[2] + b1 * v1.color[2] + b2 * v2.color[2];
+                    let idx = p * 4;
+                    if a >= 0.999 {
+                        res.depth[p] = z;
+                        res.data[idx] = float_to_u8(r);
+                        res.data[idx + 1] = float_to_u8(g);
+                        res.data[idx + 2] = float_to_u8(b);
+                        res.data[idx + 3] = 255;
+                    } else if a > 0.001 {
+                        let inv_a = 1.0 - a;
+                        res.data[idx] = float_to_u8(r * a + (res.data[idx] as f32 / 255.0) * inv_a);
+                        res.data[idx + 1] = float_to_u8(g * a + (res.data[idx + 1] as f32 / 255.0) * inv_a);
+                        res.data[idx + 2] = float_to_u8(b * a + (res.data[idx + 2] as f32 / 255.0) * inv_a);
+                        res.data[idx + 3] = 255;
+                    }
+                }
             }
             w0 += step_x0;
             w1 += step_x1;

@@ -27,7 +27,7 @@ use xsx_hle::{
 use xsx_loader::{
     default_search_dirs, GameConfig, ImportSymbol, LoadedModuleSet, PeImage, XvdContainer,
 };
-use xsx_testgen::build_hello_xsx_pe;
+use xsx_testgen::build_actual_game_xsx_pe;
 
 const WEB_HTML: &str = include_str!("gui_web.html");
 
@@ -559,7 +559,7 @@ fn api_run(body: &str) -> String {
 fn api_gen_demo(body: &str) -> String {
     let (fsr, backend, unimpl) = parse_fsr_and_backend(body);
     let demo_path = std::env::temp_dir().join(format!("xsxemu_gui_demo_{}.exe", std::process::id()));
-    if let Err(e) = fs::write(&demo_path, build_hello_xsx_pe()) {
+    if let Err(e) = fs::write(&demo_path, build_actual_game_xsx_pe()) {
         return format!("{{\"error\":\"failed to write demo binary: {}\"}}", json_escape(&e.to_string()));
     }
     let res = execute_target(&demo_path, fsr, backend, unimpl, false);
@@ -1170,7 +1170,7 @@ mod win32 {
                     }
                     ID_BTN_DEMO => {
                         let demo_path = std::env::temp_dir().join(format!("xsxemu_win_demo_{}.exe", std::process::id()));
-                        let res = match fs::write(&demo_path, build_hello_xsx_pe()) {
+                        let res = match fs::write(&demo_path, build_actual_game_xsx_pe()) {
                             Ok(()) => {
                                 let fsr = FsrConfig {
                                     mode: selected_fsr(hwnd),

@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use xsx_abi::d3d12::{
-    D3D12HeapProperties, D3D12Rect, D3D12ResourceDesc, D3D12ResourceDimension,
-    D3D12VertexBufferView, D3D12Viewport,
+    D3D12HeapProperties, D3D12IndexBufferView, D3D12Rect, D3D12ResourceDesc,
+    D3D12ResourceDimension, D3D12VertexBufferView, D3D12Viewport,
 };
 
 use crate::fsr::{self, FsrComputePlan, FsrConfig, FsrFrameStats, FsrTemporalInputs};
@@ -88,10 +88,20 @@ pub enum GpuCommand {
         slot: u32,
         view: D3D12VertexBufferView,
     },
+    SetIndexBuffer {
+        view: D3D12IndexBufferView,
+    },
     DrawInstanced {
         vertex_count: u32,
         instance_count: u32,
         start_vertex: u32,
+        start_instance: u32,
+    },
+    DrawIndexedInstanced {
+        index_count: u32,
+        instance_count: u32,
+        start_index: u32,
+        base_vertex: i32,
         start_instance: u32,
     },
     SetPipelineState {

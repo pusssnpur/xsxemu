@@ -44,4 +44,8 @@ jobs:
           test -s realgame_dry.jsonl
           printf '<Game configVersion="1"><Identity Name="CiBoot"/><TitleId>7A5F9999</TitleId><ExecutableList><Executable Name="realgame_xsx.exe" TargetDeviceFamily="XboxGen9"/></ExecutableList></Game>\n' > realgame_out/MicrosoftGame.Config
           cargo run -p xsxemu -- boot realgame_out --dry-run
+          cargo run -p xsxemu -- gen-game starlight_pkg
+          cargo run -p xsxemu -- boot starlight_pkg --backend software --force-relocate --dump-frame starlight.bmp --dump-audio starlight.wav
+          test -s starlight.bmp
+          test -s starlight.wav
 

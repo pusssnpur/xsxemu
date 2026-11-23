@@ -20,8 +20,9 @@ use xsx_loader::{
     default_search_dirs, GameConfig, ImportSymbol, LoadedModuleSet, PeImage, XvdContainer,
 };
 use xsx_testgen::{
-    build_full_stack_xsx_pe, build_hello_xsx_pe, build_helper_dll_pe, build_phase2_xsx_pe,
-    build_real_game_xsx_pe, FULLSTACK_ASSET_PAYLOAD, REALGAME_PKG_CONFIG,
+    build_actual_game_xsx_pe, build_full_stack_xsx_pe, build_hello_xsx_pe, build_helper_dll_pe,
+    build_phase2_xsx_pe, build_real_game_xsx_pe, ACTUAL_GAME_LEVEL_ASSET, ACTUAL_GAME_MANIFEST,
+    FULLSTACK_ASSET_PAYLOAD, REALGAME_PKG_CONFIG,
 };
 use xsxemu::gui::{launch_gui, GuiOptions};
 
@@ -35,6 +36,7 @@ fn print_usage() {
            xsxemu gen-phase2 <output_dir>\n\
            xsxemu gen-fullstack <output_dir>\n\
            xsxemu gen-realgame <output_dir>\n\
+           xsxemu gen-game <output_dir>\n\
            xsxemu inspect <binary.exe|dll>\n\
            xsxemu inspect-shader <shader.bin>\n\
            xsxemu inspect-xvd <container.xvd>\n\
@@ -83,6 +85,7 @@ fn main() -> ExitCode {
         "gen-phase2" => cmd_gen_phase2(&args[1..]),
         "gen-fullstack" => cmd_gen_fullstack(&args[1..]),
         "gen-realgame" => cmd_gen_realgame(&args[1..]),
+        "gen-game" => cmd_gen_game(&args[1..]),
         "inspect" => cmd_inspect(&args[1..]),
         "inspect-shader" => cmd_inspect_shader(&args[1..]),
         "inspect-xvd" => cmd_inspect_xvd(&args[1..]),
@@ -246,6 +249,42 @@ fn cmd_gen_realgame(args: &[String]) -> ExitCode {
         exe_bytes.len(),
         cfg_path.display(),
         REALGAME_PKG_CONFIG.len()
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_gen_game(args: &[String]) -> ExitCode {
+    let Some(out_dir) = args.first() else {
+        eprintln!("usage: xsxemu gen-game <output_dir>");
+        return ExitCode::from(2);
+    };
+    let dir = Path::new(out_dir);
+    let assets_dir = dir.join("assets");
+    if let Err(e) = fs::create_dir_all(&assets_dir) {
+        eprintln!("failed to create directory {}: {e}", assets_dir.display());
+        return ExitCode::FAILURE;
+    }
+    let exe_path = dir.join("starlight_xsx.exe");
+    let manifest_path = dir.join("MicrosoftGame.Config");
+    let asset_path = assets_dir.join("level.dat");
+    let exe_bytes = build_actual_game_xsx_pe();
+    if let Err(e) = fs::write(&exe_path, &exe_bytes) {
+        eprintln!("failed to write {}: {e}", exe_path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = fs::write(&manifest_path, ACTUAL_GAME_MANIFEST) {
+        eprintln!("failed to write {}: {e}", manifest_path.display());
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = fs::write(&asset_path, ACTUAL_GAME_LEVEL_ASSET) {
+        eprintln!("failed to write {}: {e}", asset_path.display());
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "Generated Xbox Series X Game package (Starlight Scarlett):\n  - {}\n  - {}\n  - {}",
+        manifest_path.display(),
+        exe_path.display(),
+        asset_path.display()
     );
     ExitCode::SUCCESS
 }

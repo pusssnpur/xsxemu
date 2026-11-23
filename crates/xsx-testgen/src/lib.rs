@@ -6,12 +6,16 @@
 //! - `full_stack_xsx.exe`: Phase 3 + Phase 4 full-stack suite (DXBC shader stripping,
 //!   PSO/RootSignature, Compute Dispatch, FSR, DirectStorage, XInput, XAudio2, XUser, XGameSave, XStore)
 
+pub mod actual_game_suite;
 pub mod full_stack_suite;
 pub mod pe_builder;
 pub mod phase2_suite;
 pub mod real_game_suite;
 pub mod x64_asm;
 
+pub use actual_game_suite::{
+    build_actual_game_xsx_pe, ACTUAL_GAME_LEVEL_ASSET, ACTUAL_GAME_MANIFEST, ACTUAL_GAME_TITLE_ID,
+};
 pub use full_stack_suite::{
     build_full_stack_xsx_pe, FULLSTACK_ASSET_PAYLOAD, FULLSTACK_SAVE_PAYLOAD,
 };

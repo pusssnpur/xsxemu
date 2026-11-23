@@ -227,6 +227,8 @@ impl ModuleRegistry {
         xgameruntime::register(&mut reg);
         services::register(&mut reg);
         d3d12_x::register(&mut reg);
+        crate::crt::register(&mut reg);
+        crate::dxgi::register(&mut reg);
         crate::xg_xs::register(&mut reg);
         crate::acphal::register(&mut reg);
         crate::middleware::register(&mut reg);

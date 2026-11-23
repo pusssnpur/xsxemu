@@ -125,6 +125,49 @@ pub fn register(reg: &mut ModuleRegistry) {
     reg.register_export("kernelx.dll", "LoadLibraryExA", hle_load_library_ex_a as *const () as usize);
     reg.register_export("kernelx.dll", "LoadLibraryExW", hle_load_library_ex_w as *const () as usize);
     reg.register_export("kernelx.dll", "FreeLibrary", hle_free_library as *const () as usize);
+
+    // Process, command line, console, pointer encoding, FLS, condvar, UTF-8/16, memory status
+    reg.register_export("kernelx.dll", "GetCurrentProcess", hle_get_current_process as *const () as usize);
+    reg.register_export("kernelx.dll", "GetCurrentThread", hle_get_current_thread as *const () as usize);
+    reg.register_export("kernelx.dll", "GetModuleFileNameA", hle_get_module_file_name_a as *const () as usize);
+    reg.register_export("kernelx.dll", "GetModuleFileNameW", hle_get_module_file_name_w as *const () as usize);
+    reg.register_export("kernelx.dll", "GetStartupInfoW", hle_get_startup_info_w as *const () as usize);
+    reg.register_export("kernelx.dll", "GetStdHandle", hle_get_std_handle as *const () as usize);
+    reg.register_export("kernelx.dll", "GetFileType", hle_get_file_type as *const () as usize);
+    reg.register_export("kernelx.dll", "GetConsoleMode", hle_get_console_mode as *const () as usize);
+    reg.register_export("kernelx.dll", "GetEnvironmentStringsW", hle_get_environment_strings_w as *const () as usize);
+    reg.register_export("kernelx.dll", "FreeEnvironmentStringsW", hle_free_environment_strings_w as *const () as usize);
+    reg.register_export("kernelx.dll", "InitializeCriticalSectionAndSpinCount", hle_init_cs_spin as *const () as usize);
+    reg.register_export("kernelx.dll", "InitializeCriticalSectionEx", hle_init_cs_ex as *const () as usize);
+    reg.register_export("kernelx.dll", "TryEnterCriticalSection", hle_try_enter_cs as *const () as usize);
+    reg.register_export("kernelx.dll", "CreateEventW", hle_create_event_w as *const () as usize);
+    reg.register_export("kernelx.dll", "WaitForMultipleObjects", hle_wait_for_multiple_objects as *const () as usize);
+    reg.register_export("kernelx.dll", "InitializeConditionVariable", hle_init_condvar as *const () as usize);
+    reg.register_export("kernelx.dll", "WakeConditionVariable", hle_wake_condvar as *const () as usize);
+    reg.register_export("kernelx.dll", "WakeAllConditionVariable", hle_wake_all_condvar as *const () as usize);
+    reg.register_export("kernelx.dll", "SleepConditionVariableCS", hle_sleep_condvar_cs as *const () as usize);
+    reg.register_export("kernelx.dll", "SleepConditionVariableSRW", hle_sleep_condvar_srw as *const () as usize);
+    reg.register_export("kernelx.dll", "InitOnceExecuteOnce", hle_init_once_execute_once as *const () as usize);
+    reg.register_export("kernelx.dll", "SwitchToThread", hle_switch_to_thread as *const () as usize);
+    reg.register_export("kernelx.dll", "GetCurrentProcessorNumber", hle_get_current_processor_number as *const () as usize);
+    reg.register_export("kernelx.dll", "SetThreadPriority", hle_return_one_i32 as *const () as usize);
+    reg.register_export("kernelx.dll", "SetThreadAffinityMask", hle_set_thread_affinity_mask as *const () as usize);
+    reg.register_export("kernelx.dll", "SetThreadDescription", hle_return_zero_i32 as *const () as usize);
+    reg.register_export("kernelx.dll", "MultiByteToWideChar", hle_multi_byte_to_wide_char as *const () as usize);
+    reg.register_export("kernelx.dll", "WideCharToMultiByte", hle_wide_char_to_multi_byte as *const () as usize);
+    reg.register_export("kernelx.dll", "GetACP", hle_get_acp as *const () as usize);
+    reg.register_export("kernelx.dll", "IsValidCodePage", hle_return_one_i32 as *const () as usize);
+    reg.register_export("kernelx.dll", "EncodePointer", hle_encode_decode_pointer as *const () as usize);
+    reg.register_export("kernelx.dll", "DecodePointer", hle_encode_decode_pointer as *const () as usize);
+    reg.register_export("kernelx.dll", "IsDebuggerPresent", hle_return_zero_i32 as *const () as usize);
+    reg.register_export("kernelx.dll", "SetUnhandledExceptionFilter", hle_set_unhandled_exception_filter as *const () as usize);
+    reg.register_export("kernelx.dll", "UnhandledExceptionFilter", hle_return_zero_i32 as *const () as usize);
+    reg.register_export("kernelx.dll", "FlsAlloc", hle_fls_alloc as *const () as usize);
+    reg.register_export("kernelx.dll", "FlsGetValue", hle_tls_get_value as *const () as usize);
+    reg.register_export("kernelx.dll", "FlsSetValue", hle_tls_set_value as *const () as usize);
+    reg.register_export("kernelx.dll", "FlsFree", hle_tls_free as *const () as usize);
+    reg.register_export("kernelx.dll", "VirtualProtect", hle_virtual_protect as *const () as usize);
+    reg.register_export("kernelx.dll", "GlobalMemoryStatusEx", hle_global_memory_status_ex as *const () as usize);
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,5 +1431,360 @@ unsafe extern "win64" fn hle_flush_instruction_cache(
     _lp_base_address: *const c_void,
     _dw_size: usize,
 ) -> i32 {
+    1
+}
+
+// ---------------------------------------------------------------------------
+// Extended Win32/Xbox Startup, Synchronization, Condvar, FLS & Encoding
+// ---------------------------------------------------------------------------
+
+unsafe extern "win64" fn hle_get_current_process() -> Handle {
+    (!0usize) as Handle
+}
+
+unsafe extern "win64" fn hle_get_current_thread() -> Handle {
+    (!1usize) as Handle
+}
+
+unsafe extern "win64" fn hle_get_module_file_name_a(
+    _h_mod: Handle,
+    buf: *mut u8,
+    size: u32,
+) -> u32 {
+    if buf.is_null() || size == 0 {
+        return 0;
+    }
+    let name = b"G:\\xsxemu_guest.exe";
+    let n = name.len().min((size as usize).saturating_sub(1));
+    core::ptr::copy_nonoverlapping(name.as_ptr(), buf, n);
+    *buf.add(n) = 0;
+    n as u32
+}
+
+unsafe extern "win64" fn hle_get_module_file_name_w(
+    _h_mod: Handle,
+    buf: *mut u16,
+    size: u32,
+) -> u32 {
+    if buf.is_null() || size == 0 {
+        return 0;
+    }
+    let units: Vec<u16> = "G:\\xsxemu_guest.exe".encode_utf16().collect();
+    let n = units.len().min((size as usize).saturating_sub(1));
+    core::ptr::copy_nonoverlapping(units.as_ptr(), buf, n);
+    *buf.add(n) = 0;
+    n as u32
+}
+
+unsafe extern "win64" fn hle_get_startup_info_w(info: *mut u8) {
+    if !info.is_null() {
+        core::ptr::write_bytes(info, 0, 104); // sizeof(STARTUPINFOW) on Win64
+        *(info as *mut u32) = 104;
+    }
+}
+
+unsafe extern "win64" fn hle_get_std_handle(std_id: u32) -> Handle {
+    match std_id {
+        0xFFFF_FFF6 => 0x1001usize as Handle, // STD_INPUT_HANDLE
+        0xFFFF_FFF5 => 0x1002usize as Handle, // STD_OUTPUT_HANDLE
+        0xFFFF_FFF4 => 0x1003usize as Handle, // STD_ERROR_HANDLE
+        _ => INVALID_HANDLE_VALUE,
+    }
+}
+
+unsafe extern "win64" fn hle_get_file_type(_h: Handle) -> u32 {
+    2 // FILE_TYPE_CHAR
+}
+
+unsafe extern "win64" fn hle_get_console_mode(_h: Handle, mode: *mut u32) -> i32 {
+    if !mode.is_null() {
+        *mode = 0x0007;
+    }
+    1
+}
+
+unsafe extern "win64" fn hle_get_environment_strings_w() -> *mut u16 {
+    static mut ENV_BLOCK: [u16; 2] = [0, 0];
+    core::ptr::addr_of_mut!(ENV_BLOCK) as *mut u16
+}
+
+unsafe extern "win64" fn hle_free_environment_strings_w(_env: *mut u16) -> i32 {
+    1
+}
+
+unsafe extern "win64" fn hle_init_cs_spin(cs: *mut CriticalSection, _spin: u32) -> i32 {
+    hle_initialize_critical_section(cs);
+    1
+}
+
+unsafe extern "win64" fn hle_init_cs_ex(cs: *mut CriticalSection, _spin: u32, _flags: u32) -> i32 {
+    hle_initialize_critical_section(cs);
+    1
+}
+
+unsafe extern "win64" fn hle_try_enter_cs(cs: *mut CriticalSection) -> i32 {
+    if cs.is_null() {
+        return 0;
+    }
+    hle_enter_critical_section(cs);
+    1
+}
+
+unsafe extern "win64" fn hle_create_event_w(
+    sec: *mut c_void,
+    manual_reset: i32,
+    initial_state: i32,
+    _name: *const u16,
+) -> Handle {
+    hle_create_event_a(sec, manual_reset, initial_state, core::ptr::null())
+}
+
+unsafe extern "win64" fn hle_wait_for_multiple_objects(
+    count: u32,
+    handles: *const Handle,
+    wait_all: i32,
+    timeout_ms: u32,
+) -> u32 {
+    if count == 0 || handles.is_null() {
+        return WAIT_FAILED;
+    }
+    let slice = core::slice::from_raw_parts(handles, count as usize);
+    if wait_all != 0 {
+        for &h in slice {
+            let rc = hle_wait_for_single_object(h, timeout_ms);
+            if rc != 0 {
+                return rc;
+            }
+        }
+        0
+    } else {
+        hle_wait_for_single_object(slice[0], timeout_ms)
+    }
+}
+
+fn condvar_mutex() -> &'static (Mutex<u64>, Condvar) {
+    static CV: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    CV.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+unsafe extern "win64" fn hle_init_condvar(cv: *mut usize) {
+    if !cv.is_null() {
+        *cv = 0;
+    }
+}
+
+unsafe extern "win64" fn hle_wake_condvar(_cv: *mut usize) {
+    let (m, c) = condvar_mutex();
+    if let Ok(mut g) = m.lock() {
+        *g = g.wrapping_add(1);
+        c.notify_one();
+    }
+}
+
+unsafe extern "win64" fn hle_wake_all_condvar(_cv: *mut usize) {
+    let (m, c) = condvar_mutex();
+    if let Ok(mut g) = m.lock() {
+        *g = g.wrapping_add(1);
+        c.notify_all();
+    }
+}
+
+unsafe extern "win64" fn hle_sleep_condvar_cs(
+    _cv: *mut usize,
+    cs: *mut CriticalSection,
+    timeout_ms: u32,
+) -> i32 {
+    hle_leave_critical_section(cs);
+    let (m, c) = condvar_mutex();
+    if let Ok(g) = m.lock() {
+        let ms = if timeout_ms == 0xFFFF_FFFF { 1 } else { timeout_ms.min(50) };
+        let _ = c.wait_timeout(g, Duration::from_millis(ms as u64));
+    }
+    hle_enter_critical_section(cs);
+    1
+}
+
+unsafe extern "win64" fn hle_sleep_condvar_srw(
+    _cv: *mut usize,
+    srw: *mut SrwLock,
+    timeout_ms: u32,
+    flags: u32,
+) -> i32 {
+    let shared = (flags & 1) != 0;
+    if shared {
+        hle_release_srw_lock_shared(srw);
+    } else {
+        hle_release_srw_lock_exclusive(srw);
+    }
+    let (m, c) = condvar_mutex();
+    if let Ok(g) = m.lock() {
+        let ms = if timeout_ms == 0xFFFF_FFFF { 1 } else { timeout_ms.min(50) };
+        let _ = c.wait_timeout(g, Duration::from_millis(ms as u64));
+    }
+    if shared {
+        hle_acquire_srw_lock_shared(srw);
+    } else {
+        hle_acquire_srw_lock_exclusive(srw);
+    }
+    1
+}
+
+unsafe extern "win64" fn hle_init_once_execute_once(
+    init_once: *mut usize,
+    init_fn: unsafe extern "win64" fn(*mut usize, *mut c_void, *mut *mut c_void) -> i32,
+    param: *mut c_void,
+    ctx: *mut *mut c_void,
+) -> i32 {
+    if init_once.is_null() {
+        return 0;
+    }
+    if *init_once == 0 {
+        let ok = init_fn(init_once, param, ctx);
+        if ok != 0 {
+            *init_once = 2; // RTL_RUN_ONCE_CHECK_ONLY / completed
+        }
+        ok
+    } else {
+        1
+    }
+}
+
+unsafe extern "win64" fn hle_switch_to_thread() -> i32 {
+    thread::yield_now();
+    1
+}
+
+unsafe extern "win64" fn hle_get_current_processor_number() -> u32 {
+    0
+}
+
+unsafe extern "win64" fn hle_return_one_i32() -> i32 {
+    1
+}
+
+unsafe extern "win64" fn hle_return_zero_i32() -> i32 {
+    0
+}
+
+unsafe extern "win64" fn hle_set_thread_affinity_mask(_t: Handle, mask: usize) -> usize {
+    mask.max(1)
+}
+
+unsafe extern "win64" fn hle_multi_byte_to_wide_char(
+    _cp: u32,
+    _flags: u32,
+    src: *const u8,
+    src_len: i32,
+    dst: *mut u16,
+    dst_len: i32,
+) -> i32 {
+    if src.is_null() {
+        return 0;
+    }
+    let bytes = if src_len < 0 {
+        let mut n = 0usize;
+        while *src.add(n) != 0 {
+            n += 1;
+        }
+        core::slice::from_raw_parts(src, n + 1)
+    } else {
+        core::slice::from_raw_parts(src, src_len as usize)
+    };
+    let s = String::from_utf8_lossy(bytes);
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if dst.is_null() || dst_len == 0 {
+        return units.len() as i32;
+    }
+    let copy = units.len().min(dst_len as usize);
+    core::ptr::copy_nonoverlapping(units.as_ptr(), dst, copy);
+    copy as i32
+}
+
+unsafe extern "win64" fn hle_wide_char_to_multi_byte(
+    _cp: u32,
+    _flags: u32,
+    src: *const u16,
+    src_len: i32,
+    dst: *mut u8,
+    dst_len: i32,
+    _def: *const u8,
+    _used_def: *mut i32,
+) -> i32 {
+    if src.is_null() {
+        return 0;
+    }
+    let units = if src_len < 0 {
+        let mut n = 0usize;
+        while *src.add(n) != 0 {
+            n += 1;
+        }
+        core::slice::from_raw_parts(src, n + 1)
+    } else {
+        core::slice::from_raw_parts(src, src_len as usize)
+    };
+    let s = String::from_utf16_lossy(units);
+    let bytes = s.as_bytes();
+    if dst.is_null() || dst_len == 0 {
+        return bytes.len() as i32;
+    }
+    let copy = bytes.len().min(dst_len as usize);
+    core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, copy);
+    copy as i32
+}
+
+unsafe extern "win64" fn hle_get_acp() -> u32 {
+    65001 // UTF-8
+}
+
+unsafe extern "win64" fn hle_encode_decode_pointer(ptr: usize) -> usize {
+    ptr
+}
+
+unsafe extern "win64" fn hle_set_unhandled_exception_filter(_f: usize) -> usize {
+    0
+}
+
+unsafe extern "win64" fn hle_fls_alloc(_cb: usize) -> u32 {
+    hle_tls_alloc()
+}
+
+unsafe extern "win64" fn hle_virtual_protect(
+    _addr: *mut c_void,
+    _size: usize,
+    _new_prot: u32,
+    old_prot: *mut u32,
+) -> i32 {
+    if !old_prot.is_null() {
+        *old_prot = 0x40; // PAGE_EXECUTE_READWRITE
+    }
+    1
+}
+
+#[repr(C)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
+unsafe extern "win64" fn hle_global_memory_status_ex(ms: *mut MemoryStatusEx) -> i32 {
+    if ms.is_null() {
+        return 0;
+    }
+    let m = &mut *ms;
+    m.dw_memory_load = 25;
+    m.ull_total_phys = 16 * 1024 * 1024 * 1024;
+    m.ull_avail_phys = 12 * 1024 * 1024 * 1024;
+    m.ull_total_page_file = 16 * 1024 * 1024 * 1024;
+    m.ull_avail_page_file = 12 * 1024 * 1024 * 1024;
+    m.ull_total_virtual = 0x0000_7FFF_FFFF_0000;
+    m.ull_avail_virtual = 0x0000_7FF0_0000_0000;
+    m.ull_avail_extended_virtual = 0;
     1
 }

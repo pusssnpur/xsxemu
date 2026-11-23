@@ -16,8 +16,8 @@ use xsx_abi::com::{
 };
 use xsx_abi::d3d12::{
     D3D12CommandQueueDesc, D3D12ComputePipelineStateDesc, D3D12CpuDescriptorHandle,
-    D3D12DescriptorHeapDesc, D3D12GraphicsPipelineStateDesc, D3D12HeapProperties, D3D12Range,
-    D3D12Rect, D3D12ResourceBarrier, D3D12ResourceDesc, D3D12VertexBufferView, D3D12Viewport,
+    D3D12DescriptorHeapDesc, D3D12GraphicsPipelineStateDesc, D3D12HeapProperties,
+    D3D12IndexBufferView, D3D12Range, D3D12Rect, D3D12ResourceBarrier, D3D12ResourceDesc, D3D12VertexBufferView, D3D12Viewport,
     D3D12XboxPresentPlaneParameters, ID3D12CommandAllocatorXVtbl, ID3D12CommandQueueXVtbl,
     ID3D12DescriptorHeapXVtbl, ID3D12DeviceXVtbl, ID3D12FenceXVtbl,
     ID3D12GraphicsCommandListXVtbl, ID3D12PipelineStateXVtbl, ID3D12ResourceXVtbl,
@@ -626,6 +626,8 @@ static CMDLIST_VTBL: ID3D12GraphicsCommandListXVtbl = ID3D12GraphicsCommandListX
     set_compute_root_signature: cmdlist_set_compute_root_signature,
     dispatch: cmdlist_dispatch,
     copy_resource: cmdlist_copy_resource,
+    ia_set_index_buffer: cmdlist_ia_set_index_buffer,
+    draw_indexed_instanced: cmdlist_draw_indexed_instanced,
 };
 
 unsafe extern "win64" fn cmdlist_close(this: *mut c_void) -> HResult {
@@ -799,6 +801,41 @@ unsafe extern "win64" fn cmdlist_draw_instanced(
         vertex_count: vertex_count_per_instance,
         instance_count,
         start_vertex: start_vertex_location,
+        start_instance: start_instance_location,
+    });
+}
+
+unsafe extern "win64" fn cmdlist_ia_set_index_buffer(
+    this: *mut c_void,
+    p_view: *const D3D12IndexBufferView,
+) {
+    if this.is_null() || p_view.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetIndexBuffer { view: *p_view });
+}
+
+unsafe extern "win64" fn cmdlist_draw_indexed_instanced(
+    this: *mut c_void,
+    index_count_per_instance: u32,
+    instance_count: u32,
+    start_index_location: u32,
+    base_vertex_location: i32,
+    start_instance_location: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    cl.commands.lock().unwrap().push(GpuCommand::DrawIndexedInstanced {
+        index_count: index_count_per_instance,
+        instance_count,
+        start_index: start_index_location,
+        base_vertex: base_vertex_location,
         start_instance: start_instance_location,
     });
 }

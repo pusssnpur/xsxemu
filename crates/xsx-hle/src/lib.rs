@@ -12,8 +12,10 @@
 
 pub mod acphal;
 pub mod audio_mixer;
+pub mod crt;
 pub mod d3d12_x;
 pub mod dstorage;
+pub mod dxgi;
 pub mod input;
 pub mod kernelx;
 pub mod middleware;
