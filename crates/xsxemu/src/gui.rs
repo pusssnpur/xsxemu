@@ -340,6 +340,8 @@ struct RunSummary {
     fsr_mode: String,
     fsr_ms: Option<f64>,
     frame: Option<PresentedFrame>,
+    audio_frames: u64,
+    audio_wav: Option<Vec<u8>>,
 }
 
 fn execute_target(
@@ -417,6 +419,8 @@ fn execute_target(
             fsr_mode: fsr.mode.name().into(),
             fsr_ms: None,
             frame: None,
+            audio_frames: 0,
+            audio_wav: None,
         });
     }
 
@@ -485,6 +489,19 @@ fn execute_target(
         ("none".into(), None)
     };
 
+    let audio_frames = runtime.audio_samples_submitted();
+    let audio_wav = if audio_frames > 0 {
+        let _ = writeln!(
+            log,
+            "Audio mixed: {} stereo 48kHz frames ({} bytes)",
+            audio_frames,
+            runtime.audio_pcm_len()
+        );
+        Some(runtime.encode_audio_wav())
+    } else {
+        None
+    };
+
     Ok(RunSummary {
         exit_code,
         log,
@@ -492,6 +509,8 @@ fn execute_target(
         fsr_mode: fsr.mode.name().into(),
         fsr_ms,
         frame: frames.into_iter().last(),
+        audio_frames,
+        audio_wav,
     })
 }
 
@@ -503,18 +522,25 @@ fn run_summary_to_json(r: Result<RunSummary, String>) -> String {
                 .as_ref()
                 .map(|f| base64_encode(&f.encode_bmp()))
                 .unwrap_or_default();
+            let wav = s
+                .audio_wav
+                .as_ref()
+                .map(|w| base64_encode(w))
+                .unwrap_or_default();
             let ms_json = s
                 .fsr_ms
                 .map(|v| format!("{v:.3}"))
                 .unwrap_or_else(|| "null".into());
             format!(
-                "{{\"exit_code\":{},\"output_res\":\"{}\",\"fsr_mode\":\"{}\",\"fsr_ms\":{},\"log\":\"{}\",\"frame_bmp_b64\":\"{}\"}}",
+                "{{\"exit_code\":{},\"output_res\":\"{}\",\"fsr_mode\":\"{}\",\"fsr_ms\":{},\"audio_frames\":{},\"log\":\"{}\",\"frame_bmp_b64\":\"{}\",\"audio_wav_b64\":\"{}\"}}",
                 s.exit_code,
                 json_escape(&s.output_res),
                 json_escape(&s.fsr_mode),
                 ms_json,
+                s.audio_frames,
                 json_escape(&s.log),
-                bmp
+                bmp,
+                wav
             )
         }
         Err(e) => format!("{{\"error\":\"{}\"}}", json_escape(&e)),

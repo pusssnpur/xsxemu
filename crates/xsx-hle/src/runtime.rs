@@ -247,6 +247,10 @@ impl GuestRuntime {
         self.audio_mixer.lock().unwrap().write_wav(path)
     }
 
+    pub fn encode_audio_wav(&self) -> Vec<u8> {
+        self.audio_mixer.lock().unwrap().encode_wav()
+    }
+
     pub fn record_dstorage_bytes(&self, bytes: u64) {
         self.dstorage_bytes_read.fetch_add(bytes, Ordering::Relaxed);
     }

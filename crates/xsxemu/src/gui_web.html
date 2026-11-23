@@ -195,6 +195,10 @@
       <div class="preview-box" id="run-preview">
         <span style="color:var(--muted);font-size:13px">Run a demo or title to preview the presented frame.</span>
       </div>
+      <div id="audio-box" class="hidden" style="margin-top:12px">
+        <label id="audio-label">XAudio2 Mixed Output (48 kHz Stereo)</label>
+        <audio id="run-audio" controls style="width:100%"></audio>
+      </div>
     </div>
   </section>
 
@@ -327,6 +331,13 @@ function applyRunResult(d) {
   $('st-exit').textContent = d.exit_code != null ? String(d.exit_code) : '—';
   if (d.frame_bmp_b64) {
     $('run-preview').innerHTML = `<img alt="FSR Frame" src="data:image/bmp;base64,${d.frame_bmp_b64}">`;
+  }
+  if (d.audio_wav_b64) {
+    $('audio-box').classList.remove('hidden');
+    $('audio-label').textContent = `XAudio2 Mixed Output (${d.audio_frames || 0} frames @ 48 kHz Stereo)`;
+    $('run-audio').src = `data:audio/wav;base64,${d.audio_wav_b64}`;
+  } else {
+    $('audio-box').classList.add('hidden');
   }
 }
 async function scanDir() {

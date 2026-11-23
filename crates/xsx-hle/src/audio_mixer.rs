@@ -125,33 +125,37 @@ impl AudioMixer {
         out_frames as u64
     }
 
-    /// Write the mixed 48 kHz 16-bit stereo PCM buffer to a RIFF/WAVE (`.wav`) file.
-    pub fn write_wav(&self, path: &Path) -> io::Result<()> {
+    /// Encode the mixed 48 kHz 16-bit stereo PCM buffer as a RIFF/WAVE (`.wav`) byte vector.
+    pub fn encode_wav(&self) -> Vec<u8> {
         let data_bytes = (self.mixed_i16.len() * 2) as u32;
         let riff_size = 36u32.saturating_add(data_bytes);
         let byte_rate = OUTPUT_SAMPLE_RATE * (OUTPUT_CHANNELS as u32) * 2;
         let block_align = OUTPUT_CHANNELS * 2;
 
-        let mut f = File::create(path)?;
-        f.write_all(b"RIFF")?;
-        f.write_all(&riff_size.to_le_bytes())?;
-        f.write_all(b"WAVE")?;
-        // fmt chunk
-        f.write_all(b"fmt ")?;
-        f.write_all(&16u32.to_le_bytes())?;
-        f.write_all(&1u16.to_le_bytes())?; // PCM
-        f.write_all(&OUTPUT_CHANNELS.to_le_bytes())?;
-        f.write_all(&OUTPUT_SAMPLE_RATE.to_le_bytes())?;
-        f.write_all(&byte_rate.to_le_bytes())?;
-        f.write_all(&block_align.to_le_bytes())?;
-        f.write_all(&16u16.to_le_bytes())?; // bits per sample
-        // data chunk
-        f.write_all(b"data")?;
-        f.write_all(&data_bytes.to_le_bytes())?;
-        let mut raw = Vec::with_capacity(self.mixed_i16.len() * 2);
+        let mut out = Vec::with_capacity(44 + data_bytes as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&riff_size.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&OUTPUT_CHANNELS.to_le_bytes());
+        out.extend_from_slice(&OUTPUT_SAMPLE_RATE.to_le_bytes());
+        out.extend_from_slice(&byte_rate.to_le_bytes());
+        out.extend_from_slice(&block_align.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_bytes.to_le_bytes());
         for &s in &self.mixed_i16 {
-            raw.extend_from_slice(&s.to_le_bytes());
+            out.extend_from_slice(&s.to_le_bytes());
         }
+        out
+    }
+
+    /// Write the mixed 48 kHz 16-bit stereo PCM buffer to a RIFF/WAVE (`.wav`) file.
+    pub fn write_wav(&self, path: &Path) -> io::Result<()> {
+        let raw = self.encode_wav();
+        let mut f = File::create(path)?;
         f.write_all(&raw)
     }
 }

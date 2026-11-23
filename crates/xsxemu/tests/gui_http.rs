@@ -57,4 +57,6 @@ fn embedded_web_gui_serves_dashboard_and_apis() {
     assert!(demo.contains("\"exit_code\":0"));
     assert!(demo.contains("\"fsr_mode\":\"Quality\""));
     assert!(demo.contains("\"frame_bmp_b64\":\"Qk0"));
+    assert!(demo.contains("\"audio_frames\":240"));
+    assert!(demo.contains("\"audio_wav_b64\":\"UklGR")); // base64("RIFF...")
 }
