@@ -1,7 +1,7 @@
 //! Binary-compatible Win64 COM objects implementing Xbox `d3d12_x` interfaces.
 //!
 //! Each COM object starts with `lp_vtbl: *const ...Vtbl` at offset 0 so guest
-//! x86_64 code can perform standard COM double-indirection calls (`mov rax, [rcx]; call [rax + slot*8]`).
+//! x86_64 code can perform standard COM double-indirection calls.
 
 use core::ffi::c_void;
 use std::ptr;
@@ -12,14 +12,16 @@ use xsx_abi::com::{
     Guid, HResult, IUnknownVtbl, E_FAIL, E_INVALIDARG, E_NOINTERFACE, E_POINTER,
     IID_ID3D12COMMAND_ALLOCATOR, IID_ID3D12COMMAND_QUEUE, IID_ID3D12DESCRIPTOR_HEAP,
     IID_ID3D12DEVICE, IID_ID3D12FENCE, IID_ID3D12GRAPHICS_COMMAND_LIST, IID_ID3D12OBJECT,
-    IID_ID3D12RESOURCE, IID_IUNKNOWN, S_OK,
+    IID_ID3D12PIPELINE_STATE, IID_ID3D12RESOURCE, IID_ID3D12ROOT_SIGNATURE, IID_IUNKNOWN, S_OK,
 };
 use xsx_abi::d3d12::{
-    D3D12CommandQueueDesc, D3D12CpuDescriptorHandle, D3D12DescriptorHeapDesc, D3D12HeapProperties,
-    D3D12Range, D3D12Rect, D3D12ResourceBarrier, D3D12ResourceDesc, D3D12VertexBufferView,
-    D3D12Viewport, D3D12XboxPresentPlaneParameters, ID3D12CommandAllocatorXVtbl,
-    ID3D12CommandQueueXVtbl, ID3D12DescriptorHeapXVtbl, ID3D12DeviceXVtbl, ID3D12FenceXVtbl,
-    ID3D12GraphicsCommandListXVtbl, ID3D12ResourceXVtbl,
+    D3D12CommandQueueDesc, D3D12ComputePipelineStateDesc, D3D12CpuDescriptorHandle,
+    D3D12DescriptorHeapDesc, D3D12GraphicsPipelineStateDesc, D3D12HeapProperties,
+    D3D12IndexBufferView, D3D12Range, D3D12Rect, D3D12ResourceBarrier, D3D12ResourceDesc, D3D12VertexBufferView, D3D12Viewport,
+    D3D12XboxPresentPlaneParameters, ID3D12CommandAllocatorXVtbl, ID3D12CommandQueueXVtbl,
+    ID3D12DescriptorHeapXVtbl, ID3D12DeviceXVtbl, ID3D12FenceXVtbl,
+    ID3D12GraphicsCommandListXVtbl, ID3D12PipelineStateXVtbl, ID3D12ResourceXVtbl,
+    ID3D12RootSignatureXVtbl,
 };
 
 use crate::backend::{D3D12Translator, GpuCommand, ResourceKind};
@@ -36,10 +38,6 @@ pub fn create_device_x_com(translator: Arc<D3D12Translator>) -> *mut c_void {
     });
     Box::into_raw(obj) as *mut c_void
 }
-
-// ===========================================================================
-// Helper macros for IUnknown boilerplate
-// ===========================================================================
 
 macro_rules! impl_iunknown {
     ($struct_ty:ty, $iid:expr, $qi:ident, $addref:ident, $release:ident) => {
@@ -114,6 +112,9 @@ static DEVICE_VTBL: ID3D12DeviceXVtbl = ID3D12DeviceXVtbl {
     create_render_target_view: device_create_render_target_view,
     create_fence: device_create_fence,
     wait_frame_event_x: device_wait_frame_event_x,
+    create_root_signature: device_create_root_signature,
+    create_graphics_pipeline_state: device_create_graphics_pipeline_state,
+    create_compute_pipeline_state: device_create_compute_pipeline_state,
 };
 
 unsafe extern "win64" fn device_create_command_queue(
@@ -297,7 +298,7 @@ unsafe extern "win64" fn device_create_fence(
 unsafe extern "win64" fn device_wait_frame_event_x(
     this: *mut c_void,
     event_type: u32,
-    _timeout_ms: u32,
+    timeout_ms: u32,
     _p_reserved: *mut c_void,
     p_frame_token: *mut u64,
 ) -> HResult {
@@ -305,7 +306,7 @@ unsafe extern "win64" fn device_wait_frame_event_x(
         return E_INVALIDARG;
     }
     let dev = &*(this as *const ComDeviceX);
-    let token = dev.translator.next_frame_token();
+    let token = dev.translator.wait_frame_event(timeout_ms);
     dev.translator.record_trace(format!(
         "ID3D12DeviceX::WaitFrameEventX(event={event_type}) -> token={token}"
     ));
@@ -314,6 +315,140 @@ unsafe extern "win64" fn device_wait_frame_event_x(
     }
     S_OK
 }
+
+unsafe extern "win64" fn device_create_root_signature(
+    this: *mut c_void,
+    _node_mask: u32,
+    p_blob: *const c_void,
+    blob_len: usize,
+    _riid: *const Guid,
+    pp_root_signature: *mut *mut c_void,
+) -> HResult {
+    if this.is_null() || pp_root_signature.is_null() {
+        return E_INVALIDARG;
+    }
+    let dev = &*(this as *const ComDeviceX);
+    let slice = if !p_blob.is_null() && blob_len > 0 {
+        std::slice::from_raw_parts(p_blob as *const u8, blob_len)
+    } else {
+        &[]
+    };
+    let root_sig_id = dev.translator.create_root_signature(slice);
+    let obj = Box::new(ComRootSignatureX {
+        lp_vtbl: &ROOTSIG_VTBL,
+        ref_count: AtomicU32::new(1),
+        root_sig_id,
+    });
+    *pp_root_signature = Box::into_raw(obj) as *mut c_void;
+    S_OK
+}
+
+unsafe extern "win64" fn device_create_graphics_pipeline_state(
+    this: *mut c_void,
+    p_desc: *const D3D12GraphicsPipelineStateDesc,
+    _riid: *const Guid,
+    pp_pso: *mut *mut c_void,
+) -> HResult {
+    if this.is_null() || p_desc.is_null() || pp_pso.is_null() {
+        return E_INVALIDARG;
+    }
+    let dev = &*(this as *const ComDeviceX);
+    let desc = &*p_desc;
+    let vs = if !desc.vs.p_shader_bytecode.is_null() && desc.vs.byte_code_length > 0 {
+        std::slice::from_raw_parts(desc.vs.p_shader_bytecode as *const u8, desc.vs.byte_code_length)
+    } else {
+        &[]
+    };
+    let ps = if !desc.ps.p_shader_bytecode.is_null() && desc.ps.byte_code_length > 0 {
+        std::slice::from_raw_parts(desc.ps.p_shader_bytecode as *const u8, desc.ps.byte_code_length)
+    } else {
+        &[]
+    };
+    let pso_id = dev.translator.create_graphics_pso(vs, ps);
+    let obj = Box::new(ComPipelineStateX {
+        lp_vtbl: &PSO_VTBL,
+        ref_count: AtomicU32::new(1),
+        pso_id,
+    });
+    *pp_pso = Box::into_raw(obj) as *mut c_void;
+    S_OK
+}
+
+unsafe extern "win64" fn device_create_compute_pipeline_state(
+    this: *mut c_void,
+    p_desc: *const D3D12ComputePipelineStateDesc,
+    _riid: *const Guid,
+    pp_pso: *mut *mut c_void,
+) -> HResult {
+    if this.is_null() || p_desc.is_null() || pp_pso.is_null() {
+        return E_INVALIDARG;
+    }
+    let dev = &*(this as *const ComDeviceX);
+    let desc = &*p_desc;
+    let cs = if !desc.cs.p_shader_bytecode.is_null() && desc.cs.byte_code_length > 0 {
+        std::slice::from_raw_parts(desc.cs.p_shader_bytecode as *const u8, desc.cs.byte_code_length)
+    } else {
+        &[]
+    };
+    let pso_id = dev.translator.create_compute_pso(cs);
+    let obj = Box::new(ComPipelineStateX {
+        lp_vtbl: &PSO_VTBL,
+        ref_count: AtomicU32::new(1),
+        pso_id,
+    });
+    *pp_pso = Box::into_raw(obj) as *mut c_void;
+    S_OK
+}
+
+// ===========================================================================
+// ID3D12RootSignatureX & ID3D12PipelineStateX
+// ===========================================================================
+
+#[repr(C)]
+struct ComRootSignatureX {
+    lp_vtbl: *const ID3D12RootSignatureXVtbl,
+    ref_count: AtomicU32,
+    root_sig_id: u64,
+}
+
+impl_iunknown!(
+    ComRootSignatureX,
+    IID_ID3D12ROOT_SIGNATURE,
+    rootsig_qi,
+    rootsig_add_ref,
+    rootsig_release
+);
+
+static ROOTSIG_VTBL: ID3D12RootSignatureXVtbl = ID3D12RootSignatureXVtbl {
+    base: IUnknownVtbl {
+        query_interface: rootsig_qi,
+        add_ref: rootsig_add_ref,
+        release: rootsig_release,
+    },
+};
+
+#[repr(C)]
+struct ComPipelineStateX {
+    lp_vtbl: *const ID3D12PipelineStateXVtbl,
+    ref_count: AtomicU32,
+    pso_id: u64,
+}
+
+impl_iunknown!(
+    ComPipelineStateX,
+    IID_ID3D12PIPELINE_STATE,
+    pso_qi,
+    pso_add_ref,
+    pso_release
+);
+
+static PSO_VTBL: ID3D12PipelineStateXVtbl = ID3D12PipelineStateXVtbl {
+    base: IUnknownVtbl {
+        query_interface: pso_qi,
+        add_ref: pso_add_ref,
+        release: pso_release,
+    },
+};
 
 // ===========================================================================
 // ID3D12CommandQueueX
@@ -486,6 +621,13 @@ static CMDLIST_VTBL: ID3D12GraphicsCommandListXVtbl = ID3D12GraphicsCommandListX
     ia_set_primitive_topology: cmdlist_ia_set_primitive_topology,
     ia_set_vertex_buffers: cmdlist_ia_set_vertex_buffers,
     draw_instanced: cmdlist_draw_instanced,
+    set_pipeline_state: cmdlist_set_pipeline_state,
+    set_graphics_root_signature: cmdlist_set_graphics_root_signature,
+    set_compute_root_signature: cmdlist_set_compute_root_signature,
+    dispatch: cmdlist_dispatch,
+    copy_resource: cmdlist_copy_resource,
+    ia_set_index_buffer: cmdlist_ia_set_index_buffer,
+    draw_indexed_instanced: cmdlist_draw_indexed_instanced,
 };
 
 unsafe extern "win64" fn cmdlist_close(this: *mut c_void) -> HResult {
@@ -549,8 +691,10 @@ unsafe extern "win64" fn cmdlist_rs_set_viewports(
         return;
     }
     let cl = &*(this as *const ComGraphicsCommandListX);
-    let vp = *p_viewports;
-    cl.commands.lock().unwrap().push(GpuCommand::SetViewport(vp));
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetViewport(*p_viewports));
 }
 
 unsafe extern "win64" fn cmdlist_rs_set_scissor_rects(
@@ -562,8 +706,10 @@ unsafe extern "win64" fn cmdlist_rs_set_scissor_rects(
         return;
     }
     let cl = &*(this as *const ComGraphicsCommandListX);
-    let rect = *p_rects;
-    cl.commands.lock().unwrap().push(GpuCommand::SetScissor(rect));
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetScissor(*p_rects));
 }
 
 unsafe extern "win64" fn cmdlist_om_set_render_targets(
@@ -595,7 +741,6 @@ unsafe extern "win64" fn cmdlist_clear_render_target_view(
         return;
     }
     let cl = &*(this as *const ComGraphicsCommandListX);
-    let color = *color_rgba;
     let rects = if num_rects > 0 && !p_rects.is_null() {
         std::slice::from_raw_parts(p_rects, num_rects as usize).to_vec()
     } else {
@@ -603,7 +748,7 @@ unsafe extern "win64" fn cmdlist_clear_render_target_view(
     };
     cl.commands.lock().unwrap().push(GpuCommand::ClearRenderTarget {
         rtv_handle: rtv.ptr,
-        color,
+        color: *color_rgba,
         rects,
     });
 }
@@ -657,6 +802,123 @@ unsafe extern "win64" fn cmdlist_draw_instanced(
         instance_count,
         start_vertex: start_vertex_location,
         start_instance: start_instance_location,
+    });
+}
+
+unsafe extern "win64" fn cmdlist_ia_set_index_buffer(
+    this: *mut c_void,
+    p_view: *const D3D12IndexBufferView,
+) {
+    if this.is_null() || p_view.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetIndexBuffer { view: *p_view });
+}
+
+unsafe extern "win64" fn cmdlist_draw_indexed_instanced(
+    this: *mut c_void,
+    index_count_per_instance: u32,
+    instance_count: u32,
+    start_index_location: u32,
+    base_vertex_location: i32,
+    start_instance_location: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    cl.commands.lock().unwrap().push(GpuCommand::DrawIndexedInstanced {
+        index_count: index_count_per_instance,
+        instance_count,
+        start_index: start_index_location,
+        base_vertex: base_vertex_location,
+        start_instance: start_instance_location,
+    });
+}
+
+unsafe extern "win64" fn cmdlist_set_pipeline_state(
+    this: *mut c_void,
+    p_pipeline_state: *mut c_void,
+) {
+    if this.is_null() || p_pipeline_state.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    let pso = &*(p_pipeline_state as *const ComPipelineStateX);
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetPipelineState { pso_id: pso.pso_id });
+}
+
+unsafe extern "win64" fn cmdlist_set_graphics_root_signature(
+    this: *mut c_void,
+    p_root_signature: *mut c_void,
+) {
+    if this.is_null() || p_root_signature.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    let rs = &*(p_root_signature as *const ComRootSignatureX);
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetGraphicsRootSignature {
+            root_sig_id: rs.root_sig_id,
+        });
+}
+
+unsafe extern "win64" fn cmdlist_set_compute_root_signature(
+    this: *mut c_void,
+    p_root_signature: *mut c_void,
+) {
+    if this.is_null() || p_root_signature.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    let rs = &*(p_root_signature as *const ComRootSignatureX);
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::SetComputeRootSignature {
+            root_sig_id: rs.root_sig_id,
+        });
+}
+
+unsafe extern "win64" fn cmdlist_dispatch(
+    this: *mut c_void,
+    x: u32,
+    y: u32,
+    z: u32,
+) {
+    if this.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    cl.commands
+        .lock()
+        .unwrap()
+        .push(GpuCommand::Dispatch { x, y, z });
+}
+
+unsafe extern "win64" fn cmdlist_copy_resource(
+    this: *mut c_void,
+    p_dst_resource: *mut c_void,
+    p_src_resource: *mut c_void,
+) {
+    if this.is_null() || p_dst_resource.is_null() || p_src_resource.is_null() {
+        return;
+    }
+    let cl = &*(this as *const ComGraphicsCommandListX);
+    let dst = &*(p_dst_resource as *const ComResourceX);
+    let src = &*(p_src_resource as *const ComResourceX);
+    cl.commands.lock().unwrap().push(GpuCommand::CopyResource {
+        dst_id: dst.resource_id,
+        src_id: src.resource_id,
     });
 }
 

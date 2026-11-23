@@ -20,10 +20,32 @@ jobs:
         run: cargo build --workspace
       - name: Run workspace tests
         run: cargo test --workspace -- --nocapture
-      - name: Run CLI end-to-end smoke test
+      - name: Run CLI end-to-end smoke tests (Phases 1-4 + default FSR)
         shell: bash
         run: |
           cargo run -p xsxemu -- gen-sample hello_xsx.exe
           cargo run -p xsxemu -- inspect hello_xsx.exe
           cargo run -p xsxemu -- run hello_xsx.exe --backend software --trace --force-relocate --dump-frame frame.bmp
           test -s frame.bmp
+          cargo run -p xsxemu -- gen-phase2 phase2_out
+          cargo run -p xsxemu -- inspect phase2_out/xsx_helper.dll
+          cargo run -p xsxemu -- inspect phase2_out/phase2_xsx.exe
+          cargo run -p xsxemu -- run phase2_out/phase2_xsx.exe --backend software --trace --force-relocate --scratch-dir phase2_scratch --dump-frame fsr_frame.bmp
+          test -s fsr_frame.bmp
+          test -s phase2_scratch/phase2_check.txt
+          cargo run -p xsxemu -- gen-fullstack fullstack_out
+          cargo run -p xsxemu -- run fullstack_out/full_stack_xsx.exe --backend software --trace --force-relocate --rtc-offset 3600 --shader-cache scache --scratch-dir fullstack_scratch --dump-frame fullstack_fsr.bmp --dump-audio fullstack_audio.wav
+          test -s fullstack_fsr.bmp
+          test -s fullstack_audio.wav
+          test -s fullstack_scratch/saves/slot0/player.sav
+          cargo run -p xsxemu -- bench-fsr --width 320 --height 180 --fsr quality
+          cargo run -p xsxemu -- gen-realgame realgame_out
+          cargo run -p xsxemu -- run realgame_out/realgame_xsx.exe --dry-run --trace-jsonl realgame_dry.jsonl
+          test -s realgame_dry.jsonl
+          printf '<Game configVersion="1"><Identity Name="CiBoot"/><TitleId>7A5F9999</TitleId><ExecutableList><Executable Name="realgame_xsx.exe" TargetDeviceFamily="XboxGen9"/></ExecutableList></Game>\n' > realgame_out/MicrosoftGame.Config
+          cargo run -p xsxemu -- boot realgame_out --dry-run
+          cargo run -p xsxemu -- gen-game starlight_pkg
+          cargo run -p xsxemu -- boot starlight_pkg --backend software --force-relocate --dump-frame starlight.bmp --dump-audio starlight.wav
+          test -s starlight.bmp
+          test -s starlight.wav
+

@@ -67,21 +67,31 @@ By targeting **Windows x86_64 with native Direct3D 12**, `xsxemu` achieves near-
 - [x] `d3d12_x` COM vtable objects, heap flag sanitization, `PresentX` translation, Windows `d3d12.dll` device bring-up, and software D3D12 rasterizer (`xsx-d3d12`)
 - [x] Clean-room x86_64 PE32+ test title generator (`xsx-testgen`) and end-to-end integration tests
 
-### Phase 2 — Real PE32+ Runtime Completeness
-- [ ] Secondary DLL loading & dependency graph resolution (guest-bundled DLLs alongside HLE modules)
-- [ ] PE TLS Directory (`IMAGE_DIRECTORY_ENTRY_TLS`) & TLS callback invocation
-- [ ] Windows x64 SEH / `.pdata` runtime function table registration (`RtlAddFunctionTable`)
-- [ ] Expanded `kernelx.dll` / `ntdll` / CRT file I/O (`CreateFileW`, `ReadFile`, virtual Xbox `G:\` / `T:\` drive mapping), threading (`CreateThread`, `SRWLOCK`, `CONDITION_VARIABLE`), and virtual memory reservation semantics
+### Phase 2 — Real PE32+ Runtime Completeness & Default FSR Integration (Complete)
+- [x] PE Export Table parsing & recursive secondary guest DLL loading (`LoadedModuleSet`, `DllMain` lifecycle, `GetModuleHandleA`/`LoadLibraryA`/`GetProcAddress`)
+- [x] PE TLS Directory (`IMAGE_DIRECTORY_ENTRY_TLS`) & automatic `PIMAGE_TLS_CALLBACK` execution (`DLL_PROCESS_ATTACH`/`DLL_PROCESS_DETACH`)
+- [x] Windows x64 SEH / `.pdata` runtime function table parsing & OS registration (`RtlAddFunctionTable` / `RtlDeleteFunctionTable` on Windows)
+- [x] Virtual Xbox drive filesystem (`G:\`, `T:\`, `D:\`, `S:\` with path-traversal containment) and `kernelx.dll` File I/O (`CreateFileA/W`, `ReadFile`, `WriteFile`, `SetFilePointerEx`, `GetFileSizeEx`, `GetFileAttributesA/W`)
+- [x] Real OS multithreading & synchronization (`CreateThread`, `WaitForSingleObject`, `GetExitCodeThread`, `SRWLOCK`, `CRITICAL_SECTION`, `Heap*`, `Tls*`)
+- [x] First-class default-enabled **AMD FSR** pipeline in `xsx-d3d12` (12-tap EASU + 5-tap RCAS, quality presets, Halton(2, 3) temporal jitter sequence, and SM 6.0 HLSL compute shaders ready for Phase 3 hardware dispatch)
 
-### Phase 3 — Native Windows Direct3D 12 Full Hardware Pipeline
-- [ ] Win32 window + `IDXGIFactory4` + `IDXGISwapChain3` presentation bound to `PresentX`
-- [ ] Real host `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList`, `ID3D12DescriptorHeap`, `ID3D12RootSignature`, and `ID3D12PipelineState` forwarding
-- [ ] Xbox UMA `D3D12_HEAP_TYPE_CUSTOM` / CPU-cached upload staging rings for discrete PC GPUs
-- [ ] Shader container inspection (`DXBC` / `DXIL` pass-through & Xbox-specific root signature / shader metadata stripping)
-- [ ] Hardware fence & frame-pacing synchronization (`WaitFrameEventX` <-> DXGI waitable swapchain object)
+### Phase 3 — Native Windows Direct3D 12 Full Hardware Pipeline & GPU FSR Compute Dispatch (Complete)
+- [x] Win32 window + `IDXGIFactory4` + `IDXGISwapChain3` presentation bound to `PresentX`
+- [x] Real host `ID3D12CommandAllocator`, `ID3D12GraphicsCommandList`, `ID3D12DescriptorHeap`, `ID3D12Fence`, and COM `ID3D12RootSignatureX` / `ID3D12PipelineStateX` / `Dispatch` / `CopyResource` translation
+- [x] Native GPU D3D12 HLSL compilation (`d3dcompiler_47.dll` for `FSR_EASU_HLSL` / `FSR_RCAS_HLSL`), `FsrComputePlan`, and FSR 2/3 temporal hook structures (`FsrTemporalInputs`, Halton(2, 3) jitter)
+- [x] Xbox UMA upload staging ring buffer (`UmaStagingRing`) with alignment and fence-based retirement for discrete PC GPUs
+- [x] Shader container inspection (`DXBC` / `DXIL` parser & Xbox-only chunk stripper for `XBOX`, `XGCS`, `XDBG`, `GCN0`, `RDNA`)
+- [x] Hardware fence & frame-pacing synchronization (`WaitFrameEventX` <-> DXGI `GetFrameLatencyWaitableObject`)
 
-### Phase 4 — Game Input, Audio, Storage & Services
-- [ ] `GameInput.dll` / `XInput` -> Windows `XInput` / `GameInput` bridge
-- [ ] `XAudio2_9.dll` -> Windows WASAPI / XAudio2 passthrough
-- [ ] `dstorage_x.dll` -> Windows DirectStorage (`dstorage.dll`) / async file I/O translation
-- [ ] `XUser` / `XStore` / `XGameSave` clean-room offline local profile & save-data persistence
+### Phase 4 — Game Input, Audio, Storage & Services (Complete)
+- [x] `GameInput.dll` / `XInput1_4.dll` -> Windows `XInput` live bridge + `VirtualGamepad` fallback & `IGameInput` COM interface
+- [x] `XAudio2_9.dll` -> `IXAudio2`, `IXAudio2MasteringVoice`, `IXAudio2SourceVoice` COM engine with PCM buffer capture
+- [x] `dstorage_x.dll` / `dstorage.dll` -> `IDStorageFactoryX`, `IDStorageFileX`, `IDStorageQueueX` streaming from `VirtualFs`
+- [x] `XUser`, `XStore`, and persistent `XGameSave` local profile, license, and on-disk save container/blob storage (`S:\`)
+
+### Phase 5 — Improvements (RTC, True Hardware GPU Replay, Performance & Sound)
+- [x] **Real-Time Clock (RTC) & System Info** (`xsx-hle::rtc`, `GetSystemTime`, `GetLocalTime`, `GetSystemTimeAsFileTime`, `GetSystemTimePreciseAsFileTime`, `SystemTimeToFileTime`, `FileTimeToSystemTime`, `GetTimeZoneInformation`, `GetSystemInfo` 8-core Zen 2 topology, `--rtc-offset`)
+- [x] **True Windows Direct3D 12 Hardware Execution** (`IDXGISwapChain3::GetBuffer`, host RTVs, `D3D12SerializeRootSignature`, host FSR Compute PSOs, real `Reset`/`ResourceBarrier`/`OMSetRenderTargets`/`ClearRenderTargetView`/`Close`/`ExecuteCommandLists`/`Present`/`Signal`/`SetEventOnCompletion` GPU synchronization, Win32 message pumping)
+- [x] **Performance Improvements**: Multithreaded row-band FSR (`std::thread::scope`) with border-padded linear RGB+luma prepass (`bench-fsr`), authentic Microsoft DXBC MD5-variant digest recomputation, and persistent on-disk `ShaderCache` (`--shader-cache`)
+- [x] **Sound Improvements**: 48 kHz stereo multi-voice `AudioMixer` with linear resampling, soft-clipping saturation, RIFF/WAVE `.wav` export (`--dump-audio`), and live Windows `winmm.dll` `waveOut` playback (`--live-audio`)
+- [ ] Future: Full hardware GPU vertex/shader replay + GPU-side FSR 2/3 temporal reprojection pass onto `IDXGISwapChain3` backbuffers & expanded WinRT/CRT compatibility for retail Dev Mode titles

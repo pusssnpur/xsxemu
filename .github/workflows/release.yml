@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  package-and-upload:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            bin: xsxemu
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: windows-x86_64
+            bin: xsxemu.exe
+            archive_ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        run: cargo test --workspace
+      - name: Build release binary
+        run: cargo build --release -p xsxemu
+      - name: Package release archive
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
+          EXT: ${{ matrix.archive_ext }}
+        run: |
+          mkdir -p dist/pkg
+          cp "target/release/${BIN}" dist/pkg/
+          cp README.md dist/pkg/
+          if [ -f LICENSE ]; then cp LICENSE dist/pkg/; fi
+          ARCHIVE="xsxemu-${TAG}-${TARGET}.${EXT}"
+          if [ "${EXT}" = "tar.gz" ]; then
+            tar -czf "dist/${ARCHIVE}" -C dist/pkg .
+          else
+            (cd dist/pkg && 7z a -tzip "../${ARCHIVE}" .)
+          fi
+          (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
+      - name: Upload assets to GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.archive_ext }}
+        run: |
+          ARCHIVE="dist/xsxemu-${TAG}-${TARGET}.${EXT}"
+          gh release upload "${TAG}" "${ARCHIVE}" "${ARCHIVE}.sha256" --clobber

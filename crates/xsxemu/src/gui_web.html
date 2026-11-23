@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>xsxemu — Xbox Series X|S Translation Layer</title>
+<style>
+  :root {
+    --bg: #0c0f14;
+    --panel: #141922;
+    --panel2: #1a212d;
+    --border: #273142;
+    --text: #e6edf6;
+    --muted: #8b9bb4;
+    --xbox: #107c10;
+    --xbox-hi: #1fb81f;
+    --accent: #38bdf8;
+    --warn: #f59e0b;
+    --err: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.45;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 24px; background: linear-gradient(90deg, #0b160e, #121822);
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .orb {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, var(--xbox-hi), var(--xbox) 65%, #073d07);
+    box-shadow: 0 0 14px rgba(31, 184, 31, 0.45);
+    display: grid; place-items: center; font-weight: 800; font-size: 16px;
+  }
+  .brand h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
+  .brand small { color: var(--muted); font-size: 12px; display: block; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 999px; background: #102a14; border: 1px solid #1e5b24;
+    color: #86efac; font-size: 12px; font-weight: 600;
+  }
+  nav {
+    display: flex; gap: 6px; padding: 10px 24px; background: var(--panel);
+    border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  nav button {
+    background: transparent; color: var(--muted); border: 1px solid transparent;
+    padding: 7px 14px; border-radius: 8px; cursor: pointer; font-weight: 600; font-size: 13px;
+  }
+  nav button.active {
+    background: var(--panel2); color: var(--text); border-color: var(--border);
+    box-shadow: inset 0 -2px 0 var(--xbox-hi);
+  }
+  main { max-width: 1280px; margin: 20px auto; padding: 0 20px 40px; }
+  .grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 18px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 18px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 15px; color: #f8fafc; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, select, textarea {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 13px;
+  }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+  button.btn {
+    background: var(--xbox); color: #fff; border: none; border-radius: 8px;
+    padding: 9px 16px; font-weight: 600; font-size: 13px; cursor: pointer;
+  }
+  button.btn:hover { background: var(--xbox-hi); }
+  button.sec { background: var(--panel2); border: 1px solid var(--border); color: var(--text); }
+  button.sec:hover { border-color: var(--accent); }
+  pre {
+    background: #080b0f; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; font-size: 12px; overflow: auto; max-height: 360px;
+    white-space: pre-wrap; word-break: break-word; color: #cbd5e1;
+  }
+  .preview-box {
+    background: #06080b; border: 1px dashed var(--border); border-radius: 10px;
+    min-height: 240px; display: grid; place-items: center; overflow: hidden; padding: 8px;
+  }
+  .preview-box img { max-width: 100%; max-height: 360px; border-radius: 6px; image-rendering: auto; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 12px; }
+  .stat { background: var(--panel2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+  .stat b { display: block; font-size: 16px; color: #fff; }
+  .stat span { font-size: 11px; color: var(--muted); }
+  .pkg-list { max-height: 160px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 8px; }
+  .pkg-item {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: 12px; cursor: pointer;
+  }
+  .pkg-item:hover { background: var(--panel2); }
+  .hidden { display: none; }
+  .pad { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; max-width: 420px; }
+  .pad button {
+    padding: 12px 8px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); font-weight: 700; cursor: pointer;
+  }
+  .pad button.down { background: var(--xbox); border-color: var(--xbox-hi); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="orb">X</div>
+    <div>
+      <h1>xsxemu <span style="font-weight:400;color:var(--muted)">v<span id="ver">0.1.0</span></span></h1>
+      <small>Clean-Room Xbox Series X|S Translation Layer • Native D3D12 + AMD FSR</small>
+    </div>
+  </div>
+  <div class="pill" id="host-pill">AMD FSR Quality (Default) • Loading...</div>
+</header>
+
+<nav>
+  <button class="active" onclick="showTab('launcher', this)">Launcher &amp; Framebuffer</button>
+  <button onclick="showTab('fsr', this)">AMD FSR Benchmark</button>
+  <button onclick="showTab('tools', this)">PE / RDNA 2 / XVD Tools</button>
+  <button onclick="showTab('pad', this)">Controller Tester</button>
+</nav>
+
+<main>
+  <section id="tab-launcher" class="grid">
+    <div class="card">
+      <h2>Launch Xbox Package or PE32+ Executable</h2>
+      <label>Package Directory or .exe Path</label>
+      <input id="run-path" placeholder="/path/to/game_dir or /path/to/game.exe">
+      <div class="row">
+        <div>
+          <label>AMD FSR Mode (Default: Quality)</label>
+          <select id="run-fsr">
+            <option value="quality" selected>Quality (1.5x — Default)</option>
+            <option value="ultra-quality">UltraQuality (1.3x)</option>
+            <option value="balanced">Balanced (1.7x)</option>
+            <option value="performance">Performance (2.0x)</option>
+            <option value="ultra-performance">UltraPerformance (3.0x)</option>
+            <option value="native-aa">NativeAA (1.0x RCAS)</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div>
+          <label>GPU Backend</label>
+          <select id="run-backend">
+            <option value="auto" selected>Auto (Native D3D12 on Windows)</option>
+            <option value="d3d12">Native D3D12</option>
+            <option value="software">Software Rasterizer</option>
+          </select>
+        </div>
+      </div>
+      <div class="row3">
+        <div>
+          <label>RCAS Sharpness (0.0 - 1.0)</label>
+          <input id="run-sharp" type="number" step="0.1" min="0" max="1" value="0.8">
+        </div>
+        <div>
+          <label>Unimplemented Imports</label>
+          <select id="run-unimpl">
+            <option value="log" selected>log (default)</option>
+            <option value="fail">fail (E_NOTIMPL)</option>
+            <option value="stop">stop</option>
+          </select>
+        </div>
+        <div>
+          <label>Execution Mode</label>
+          <select id="run-mode">
+            <option value="exec" selected>Execute Guest</option>
+            <option value="dry">Dry-Run Import Audit</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" onclick="runTitle()">Boot / Run Target</button>
+        <button class="sec btn" onclick="runDemo()">Run Built-in XSX Demo (FSR Quality)</button>
+        <button class="sec btn" onclick="scanDir()">Scan Directory</button>
+      </div>
+      <div id="pkg-list" class="pkg-list hidden"></div>
+      <label>Runtime Log &amp; Telemetry</label>
+      <pre id="run-log">Ready. Enter a package/exe path or click "Run Built-in XSX Demo".</pre>
+    </div>
+
+    <div class="card">
+      <h2>Presented Framebuffer (FSR Upscaled)</h2>
+      <div class="stats">
+        <div class="stat"><b id="st-res">—</b><span>Output Res</span></div>
+        <div class="stat"><b id="st-fsr">Quality</b><span>FSR Mode</span></div>
+        <div class="stat"><b id="st-ms">—</b><span>FSR Time</span></div>
+        <div class="stat"><b id="st-exit">—</b><span>Exit Code</span></div>
+      </div>
+      <div class="preview-box" id="run-preview">
+        <span style="color:var(--muted);font-size:13px">Run a demo or title to preview the presented frame.</span>
+      </div>
+      <div id="audio-box" class="hidden" style="margin-top:12px">
+        <label id="audio-label">XAudio2 Mixed Output (48 kHz Stereo)</label>
+        <audio id="run-audio" controls style="width:100%"></audio>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-fsr" class="grid hidden">
+    <div class="card">
+      <h2>AMD FidelityFX Super Resolution Benchmark (EASU + RCAS)</h2>
+      <div class="row3">
+        <div>
+          <label>Input Width</label>
+          <input id="fsr-w" type="number" value="1280">
+        </div>
+        <div>
+          <label>Input Height</label>
+          <input id="fsr-h" type="number" value="720">
+        </div>
+        <div>
+          <label>Iterations</label>
+          <input id="fsr-iters" type="number" value="5" min="1" max="50">
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>FSR Preset</label>
+          <select id="fsr-mode">
+            <option value="quality" selected>Quality (1.5x)</option>
+            <option value="ultra-quality">UltraQuality (1.3x)</option>
+            <option value="balanced">Balanced (1.7x)</option>
+            <option value="performance">Performance (2.0x)</option>
+            <option value="ultra-performance">UltraPerformance (3.0x)</option>
+            <option value="native-aa">NativeAA (1.0x)</option>
+          </select>
+        </div>
+        <div>
+          <label>RCAS Sharpness</label>
+          <input id="fsr-sharp" type="number" step="0.1" min="0" max="1" value="0.8">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" onclick="benchFsr()">Run FSR Benchmark</button>
+      </div>
+      <pre id="fsr-out">Click "Run FSR Benchmark" to measure steady-state EASU + RCAS throughput.</pre>
+    </div>
+    <div class="card">
+      <h2>Upscaled Pattern Preview</h2>
+      <div class="preview-box" id="fsr-preview">
+        <span style="color:var(--muted);font-size:13px">Benchmark output image appears here.</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-tools" class="card hidden">
+    <h2>PE32+, RDNA 2 Disassembler, HLSL Lifter &amp; XVD Inspector</h2>
+    <div class="row">
+      <div>
+        <label>Target File (.exe / .dll / .bin / .xvd)</label>
+        <input id="tool-path" placeholder="/path/to/shader.bin or binary.exe">
+      </div>
+      <div>
+        <label>HLSL Target Stage</label>
+        <select id="tool-stage">
+          <option value="ps" selected>Pixel Shader (ps_6_0)</option>
+          <option value="vs">Vertex Shader (vs_6_0)</option>
+          <option value="cs">Compute Shader (cs_6_0)</option>
+        </select>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn" onclick="runTool('inspect-pe')">Inspect PE32+</button>
+      <button class="sec btn" onclick="runTool('disasm')">Disassemble RDNA 2</button>
+      <button class="sec btn" onclick="runTool('lift-hlsl')">Lift to SM 6.0 HLSL</button>
+      <button class="sec btn" onclick="runTool('inspect-xvd')">Inspect XVD Container</button>
+    </div>
+    <pre id="tool-out" style="margin-top:14px">Select a file and choose an inspection tool.</pre>
+  </section>
+
+  <section id="tab-pad" class="card hidden">
+    <h2>Virtual Xbox Series X Controller (KeyboardGamepadMapper)</h2>
+    <p style="color:var(--muted);font-size:13px">Press keyboard keys (WASD / Arrows, Enter=A, Backspace=B, Space=X, E=Y, Q/R=LB/RB) or click buttons below to test XInput state.</p>
+    <div class="pad" id="pad-grid"></div>
+    <pre id="pad-out" style="margin-top:14px">Buttons mask: 0x0000</pre>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+function showTab(name, btn) {
+  for (const s of document.querySelectorAll('main > section')) s.classList.add('hidden');
+  $('tab-' + name).classList.remove('hidden');
+  for (const b of document.querySelectorAll('nav button')) b.classList.remove('active');
+  if (btn) btn.classList.add('active');
+}
+async function postJson(url, body) {
+  const r = await fetch(url, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+async function loadStatus() {
+  const s = await (await fetch('/api/status')).json();
+  $('ver').textContent = s.version;
+  $('host-pill').textContent = `FSR ${s.default_fsr} (Default) • ${s.os} • ${s.threads} threads`;
+}
+async function runTitle() {
+  $('run-log').textContent = 'Running...';
+  const d = await postJson('/api/run', {
+    path: $('run-path').value,
+    fsr: $('run-fsr').value,
+    backend: $('run-backend').value,
+    sharpness: parseFloat($('run-sharp').value || '0.8'),
+    unimplemented: $('run-unimpl').value,
+    dry_run: $('run-mode').value === 'dry'
+  });
+  applyRunResult(d);
+}
+async function runDemo() {
+  $('run-log').textContent = 'Generating & executing Xbox Series X demo...';
+  const d = await postJson('/api/gen-demo', {
+    fsr: $('run-fsr').value,
+    backend: $('run-backend').value,
+    sharpness: parseFloat($('run-sharp').value || '0.8')
+  });
+  applyRunResult(d);
+}
+function applyRunResult(d) {
+  $('run-log').textContent = d.log || d.error || JSON.stringify(d, null, 2);
+  $('st-res').textContent = d.output_res || '—';
+  $('st-fsr').textContent = d.fsr_mode || '—';
+  $('st-ms').textContent = d.fsr_ms != null ? d.fsr_ms.toFixed(2) + ' ms' : '—';
+  $('st-exit').textContent = d.exit_code != null ? String(d.exit_code) : '—';
+  if (d.frame_bmp_b64) {
+    $('run-preview').innerHTML = `<img alt="FSR Frame" src="data:image/bmp;base64,${d.frame_bmp_b64}">`;
+  }
+  if (d.audio_wav_b64) {
+    $('audio-box').classList.remove('hidden');
+    $('audio-label').textContent = `XAudio2 Mixed Output (${d.audio_frames || 0} frames @ 48 kHz Stereo)`;
+    $('run-audio').src = `data:audio/wav;base64,${d.audio_wav_b64}`;
+  } else {
+    $('audio-box').classList.add('hidden');
+  }
+}
+async function scanDir() {
+  const dir = $('run-path').value || '.';
+  const d = await (await fetch('/api/packages?dir=' + encodeURIComponent(dir))).json();
+  const box = $('pkg-list');
+  box.classList.remove('hidden');
+  if (!d.entries || d.entries.length === 0) {
+    box.innerHTML = '<div class="pkg-item">No packages or .exe files found in ' + dir + '</div>';
+    return;
+  }
+  box.innerHTML = d.entries.map(e =>
+    `<div class="pkg-item" onclick="$('run-path').value='${e.path.replace(/'/g,"\\'")}'"><b>${e.kind}</b><span>${e.path}</span></div>`
+  ).join('');
+}
+async function benchFsr() {
+  $('fsr-out').textContent = 'Benchmarking...';
+  const d = await postJson('/api/bench-fsr', {
+    width: parseInt($('fsr-w').value, 10) || 1280,
+    height: parseInt($('fsr-h').value, 10) || 720,
+    iters: parseInt($('fsr-iters').value, 10) || 5,
+    fsr: $('fsr-mode').value,
+    sharpness: parseFloat($('fsr-sharp').value || '0.8')
+  });
+  $('fsr-out').textContent = d.summary || d.error;
+  if (d.frame_bmp_b64) {
+    $('fsr-preview').innerHTML = `<img alt="FSR Bench" src="data:image/bmp;base64,${d.frame_bmp_b64}">`;
+  }
+}
+async function runTool(kind) {
+  $('tool-out').textContent = 'Inspecting...';
+  const d = await postJson('/api/' + kind, {
+    path: $('tool-path').value,
+    stage: $('tool-stage').value
+  });
+  $('tool-out').textContent = d.output || d.error || JSON.stringify(d, null, 2);
+}
+const PAD_BTNS = [
+  ['A', 0x1000], ['B', 0x2000], ['X', 0x4000], ['Y', 0x8000],
+  ['UP', 0x0001], ['DOWN', 0x0002], ['LEFT', 0x0004], ['RIGHT', 0x0008],
+  ['LB', 0x0100], ['RB', 0x0200], ['START', 0x0010], ['BACK', 0x0020]
+];
+let padMask = 0;
+function renderPad() {
+  $('pad-grid').innerHTML = PAD_BTNS.map(([n, m]) =>
+    `<button class="${(padMask & m) ? 'down' : ''}" onclick="togglePad(${m})">${n}</button>`
+  ).join('');
+  const active = PAD_BTNS.filter(([,m]) => padMask & m).map(([n]) => n).join(', ') || 'none';
+  $('pad-out').textContent = `XINPUT_GAMEPAD.wButtons = 0x${padMask.toString(16).padStart(4,'0').toUpperCase()} (${active})`;
+}
+function togglePad(m) { padMask ^= m; renderPad(); }
+const KEY_MAP = { Enter:0x1000, Backspace:0x2000, ' ':0x4000, KeyE:0x8000, ArrowUp:0x0001, ArrowDown:0x0002, ArrowLeft:0x0004, ArrowRight:0x0008, KeyQ:0x0100, KeyR:0x0200 };
+window.addEventListener('keydown', e => { if (KEY_MAP[e.code]) { padMask |= KEY_MAP[e.code]; renderPad(); }});
+window.addEventListener('keyup', e => { if (KEY_MAP[e.code]) { padMask &= ~KEY_MAP[e.code]; renderPad(); }});
+renderPad();
+loadStatus();
+</script>
+</body>
+</html>
